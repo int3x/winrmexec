@@ -1,0 +1,4 @@
+impacket
+requests
+pycryptodome
+xmltodict
