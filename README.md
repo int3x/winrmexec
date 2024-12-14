@@ -68,7 +68,7 @@ If you have a TGS for SPN other than HTTP (for example CIFS) it still works (at 
 If `-dc-ip` is not specified then `-dc-ip=domain`. For `-url` / `-port` / `-ssl` same rules apply as for NTLM.
 
 ### Basic Auth:
-Not likelyto be enabled, but if it is same rules as for NTLM (but no `-hashes`)
+Not likely to be enabled, but if it is, same rules as for NTLM (but no `-hashes`)
 ```bash
 winrmexec.py -basic username:password@dc.box.htb
 winrmexec.py -basic -target-ip '10.10.11.xx' 'username:password@whatever'
