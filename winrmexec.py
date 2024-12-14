@@ -1003,7 +1003,7 @@ class Shell:
                     self.help()
                 else:
                     if self.stdout_log:
-                        self.stdout_log.write(f"PS {self.cwd}> {cmd}\n")
+                        self.stdout_log.write(f"PS {self.cwd}> {cmd}\n".encode())
                         self.stdout_log.flush()
                     self.run_with_interrupt(runspace, cmd, self.fancy_output)
                     self.update_cwd(runspace)
@@ -1152,14 +1152,16 @@ class Shell:
                 dst = Path(dst.parent).joinpath(f"{dst.name}.zip")
             logging.info(f"{src} is a directory, will download a zip file of its contents to {dst.resolve()}")
 
-            tmpfn = self.run_sync(runspace, "[System.IO.Path]::GetTempPath()")
-            tmpfn = tmpfn + randbytes(8).hex()
+            tmpdir = self.run_sync(runspace, "[System.IO.Path]::GetTempPath()")
+            tmpnm = randbytes(8).hex()
+            tmpfn = tmpdir + tmpnm
             ps = f"""
+                New-Item -Path "{tmpdir}" -ItemType Directory -Name "{tmpnm}" | Out-Null
                 Get-ChildItem -Force -Recurse -Path "{src}" | ForEach-Object {{
-                    if(-not ($_.FullName -Like "*{tmpfn}*")) {{
+                    if(-not ($_.FullName -Like "*{tmpnm}*")) {{
                         try {{
                             $dst = $_.FullName.Replace((Resolve-Path "{src}"), "")
-                            Copy-Item -ErrorAction SilentlyContinue -Force $_.FullName "{tmpfn}\\{src.name}\\${{dst}}"
+                            Copy-Item -ErrorAction SilentlyContinue -Force $_.FullName "{tmpfn}\\$dst"
                         }} catch {{
                             Write-Warning "skipping $dst"
                         }}
@@ -1428,4 +1430,3 @@ Same as for NTLM except hashes are not supported:
 
 if __name__ == "__main__":
     main()
-
