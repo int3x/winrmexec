@@ -1,4 +1,3 @@
 impacket
 requests
-pycryptodome
 xmltodict
