@@ -20,8 +20,8 @@ import xmltodict                          # pip install xmltodict
 
 from requests import Session              # pip install requests
 
-from Crypto.Hash import HMAC, MD5, SHA256 # pip install pycryptodome
-from Crypto.Cipher import ARC4
+from Cryptodome.Hash import HMAC, MD5, SHA256
+from Cryptodome.Cipher import ARC4
 
 
 # -- impacket: ------------------------------------------------------------------------------------
