@@ -1127,7 +1127,7 @@ class Shell:
 
         if background:
             op = "Invoke-Expression $([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)))"
-            cmdb64 = commands = "@(" + ",".join("'" + b64str(c) + "'" for c in commands) + ")"
+            commands = commands = "@(" + ",".join("'" + b64str(c) + "'" for c in commands) + ")"
             commands = [f"Start-Job -ScriptBlock {{ {cmdb64} | foreach {{ {op} }} }}"]
 
         for ps in commands:
@@ -1316,6 +1316,7 @@ Same as for NTLM except hashes are not supported:
   # winrmexec.py -basic -target-ip '10.10.11.xx' 'username:password@whatever'
   # winrmexec.py -basic -target-ip '10.10.11.xx' -ssl 'username:password@whatever'
   # winrmexec.py -basic -url 'http://10.10.11.xx/endpoint' 'username:password@whatever'
+
     """
 
     print(version.BANNER)
