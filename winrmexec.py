@@ -999,13 +999,20 @@ class Shell:
             self.start_log()
 
         try:
-            from prompt_toolkit import prompt, ANSI
-            from prompt_toolkit.history import FileHistory
-            __history = FileHistory(".winrmexec_prompt_toolkit_history")
-            self.prompt = lambda s: prompt(ANSI(s), history=__history, enable_history_search=True)
+            if sys.stdout.isatty():
+                from prompt_toolkit import prompt, ANSI
+                from prompt_toolkit.history import FileHistory
+                __history = FileHistory(".winrmexec_prompt_toolkit_history")
+                self.prompt = lambda s: prompt(ANSI(s), history=__history, enable_history_search=True)
+            else:
+                raise ModuleNotFoundError # fallthrough to use readline
+
         except ModuleNotFoundError:
-            logging.warning("'prompt_toolkit' not installed, using built-in 'readline'")
             import readline, atexit
+
+            if sys.stdout.isatty():
+                logging.warning("'prompt_toolkit' not installed, using built-in 'readline'")
+
             histfile = ".winrmexec_readline_history"
             try:
                 readline.read_history_file(histfile)
@@ -1100,7 +1107,7 @@ class Shell:
     def read_line(self):
         while True:
             try:
-                cmd = self.prompt(f"\x1b[1m\x1b[31m😈\x1b[0m {self.cwd}\n\x1b[1m\x1b[33mPS\x1b[0m > ")
+                cmd = self.prompt(f"\x1b[1m\x1b[33mPS\x1b[0m {self.cwd}> ")
             except KeyboardInterrupt:
                 continue
             except EOFError:
