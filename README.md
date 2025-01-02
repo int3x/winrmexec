@@ -328,6 +328,6 @@ $ openssl x509 -req -extfile admin.conf -in admin.csr -sha256 -days 365 -extensi
 ```
 And then
 ```console
-winrmexec.py -cert-pem 'admin.pem' -cert-key 'admin.key' 192.168.56.105
+winrmexec.py -cert-pem 'admin.pem' -cert-key 'admin.key' dc01.test.lab
 ```
 
