@@ -1,13 +1,12 @@
 import os, sys, re, uuid, logging, time, ssl
 
-from copy import deepcopy
 from base64 import b64encode, b64decode
-from struct import pack, unpack, error
-from random import randbytes, randint
+from struct import pack, unpack
+from random import randbytes
+from pathlib import Path
 from datetime import datetime, UTC
 
-# pip install xmltodict
-import xmltodict
+import xml.etree.ElementTree as ET
 
 # pip install requests
 from requests import Session
@@ -16,62 +15,54 @@ from urllib3 import disable_warnings
 from urllib3.util import SKIP_HEADER
 from urllib.parse import urlparse
 from urllib3.exceptions import InsecureRequestWarning
-
 disable_warnings(category=InsecureRequestWarning)
 
 # -- impacket: ------------------------------------------------------------------------------------
 from pyasn1.codec.ber import encoder, decoder
 from pyasn1.type.univ import ObjectIdentifier, noValue
 
-from impacket.krb5.asn1 import AP_REQ, AP_REP, TGS_REP, seq_set
-from impacket.krb5.asn1 import Authenticator, EncAPRepPart
-
 from impacket.ntlm import getNTLMSSPType1, getNTLMSSPType3, SEALKEY, SIGNKEY, SEAL, SIGN
-from impacket.ntlm import NTLMAuthChallenge, AV_PAIRS, NTLMSSP_AV_CHANNEL_BINDINGS
+from impacket.ntlm import NTLMAuthNegotiate, NTLMAuthChallenge, NTLMAuthChallengeResponse
+from impacket.ntlm import AV_PAIRS, NTLMSSP_AV_CHANNEL_BINDINGS
 
+from impacket.krb5.asn1 import AP_REQ, AP_REP, TGS_REP, Authenticator, EncAPRepPart
+from impacket.krb5.asn1 import seq_set, _sequence_component, _sequence_optional_component
 from impacket.krb5.types import Principal, KerberosTime, Ticket
 from impacket.krb5.crypto import Key, _enctype_table
 from impacket.krb5.ccache import CCache
 from impacket.krb5.constants import PrincipalNameType, ApplicationTagNumbers, encodeFlags
-from impacket.krb5.kerberosv5 import getKerberosTGS, getKerberosTGT, KerberosError
+from impacket.krb5.kerberosv5 import getKerberosTGS, getKerberosTGT
 
 from impacket.krb5.gssapi import GSSAPI, KRB5_AP_REQ, CheckSumField
 from impacket.krb5.gssapi import GSS_C_MUTUAL_FLAG, GSS_C_REPLAY_FLAG, GSS_C_SEQUENCE_FLAG
-from impacket.krb5.gssapi import GSS_C_CONF_FLAG, GSS_C_INTEG_FLAG
+from impacket.krb5.gssapi import GSS_C_CONF_FLAG, GSS_C_INTEG_FLAG, KG_USAGE_INITIATOR_SEAL
+from impacket.krb5.gssapi import KG_USAGE_ACCEPTOR_SEAL
+
+from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
 
 from impacket import version
 from impacket.examples import logger
 from impacket.examples.utils import parse_target
 
+import pyasn1.type as asn1
+from pyasn1.type import univ, namedtype, tag
+
 from Cryptodome.Hash import HMAC, MD5, SHA256
 from Cryptodome.Cipher import ARC4
 
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 # -- helpers and constants: -----------------------------------------------------------------------
-def between(buf, pre, suf):
-    off = buf.index(pre) + len(pre)
-    buf = buf[off:]
-    off = buf.index(suf)
-    return buf[:off]
-
-def chunks(xs, n):
-    for off in range(0, len(xs), n):
-        yield xs[off:off+n]
-
 def b64str(s):
     if isinstance(s, str):
         return b64encode(s.encode()).decode()
     else:
         return b64encode(s).decode()
 
-def serialize(obj):
-    return xmltodict.unparse(obj, full_document=False).encode()
-
-def deserialize(data):
-    return xmltodict.parse(data, strip_whitespace=False)
-
 _utfstr = re.compile(r'_x([0-9a-fA-F]{4})_')
 def utfstr(s):
-    # chars inside xml strings that have non-printable characters are encoded like this, eg:
+    # strings inside clixml that have non-printable characters are encoded like this, eg:
     # '\n' would be "_x000A_", etc.. although i don't know how to tell if a charcter was
     # encoded during xml serialization or there was a literal *string* "_x000A_" somewhere
     # to begin with:
@@ -83,13 +74,13 @@ def utfstr(s):
 zero_uuid = str(uuid.UUID(bytes_le=bytes(16))).upper()
 
 # stolen from https://github.com/skelsec/asyauth/blob/main/asyauth/protocols/kerberos/gssapi.py
-# as i could not find anything like this in impacket:
+# this parses as GSSAPI structure from impacket.spnego but if i use that to create this it fails
+# for whatever reason...
 def krb5_mech_indep_token_encode(oid, data):
-    oid = encoder.encode(ObjectIdentifier(oid)) # KRB5 - Kerberos 5
-    payload = oid + data
+    payload = encoder.encode(ObjectIdentifier(oid)) + data
     n = len(payload)
     if n < 128:
-        size = n.to_bytes(1, byteorder="big")
+        size = n.to_bytes(1, "big")
     else:
         size = n.to_bytes((n.bit_length() + 7) // 8, "big")
         size = (128 + len(size)).to_bytes(1, "big") + size
@@ -100,47 +91,73 @@ def krb5_mech_indep_token_decode(data):
     skip = 2 + (data[1] if data[1] < 128 else (data[1] - 128))
     return decoder.decode(data[skip:], asn1Spec=ObjectIdentifier)
 
-# -- soap templates for winrm: --------------------------------------------------------------------
-soap_req_tmpl = {
-    's:Envelope': {
-        '@xmlns:rsp': 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell',
-        '@xmlns:s': 'http://www.w3.org/2003/05/soap-envelope',
-        '@xmlns:wsa': 'http://schemas.xmlsoap.org/ws/2004/08/addressing',
-        '@xmlns:wsman': 'http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd',
-        '@xmlns:wsmv': 'http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd',
-        's:Header': {
-            'wsa:Action': { '@s:mustUnderstand': 'true', '#text': 'REPLACEME' },
-            'wsmv:DataLocale': { '@s:mustUnderstand': 'false', '@xml:lang': 'en-US' },
-            'wsman:Locale': { '@s:mustUnderstand': 'false', '@xml:lang': 'en-US' },
-            'wsman:MaxEnvelopeSize': { '@s:mustUnderstand': 'true', '#text': '64000' },
-            'wsa:MessageID': 'REPLACEME', #f"uuid:{message_id}"
-            'wsman:OperationTimeout': 'REPLACEME', # f"PT{timeout}S"
-            'wsa:ReplyTo': {
-                'wsa:Address': {
-                    '@s:mustUnderstand': 'true',
-                    '#text': 'http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous'
-                }
-            },
-            'wsman:ResourceURI': {
-                '@s:mustUnderstand': 'true',
-                '#text': 'http://schemas.microsoft.com/powershell/Microsoft.PowerShell'
-            },
-            'wsmv:SessionId': { '@s:mustUnderstand': 'false', '#text': 'REPLACEME' },
-            'wsa:To': 'http://localhost',
-            'wsman:OptionSet': {
-                '@s:mustUnderstand': 'true',
-                #'wsman:Option': { REPLACEME }
-            },
-            "wsman:SelectorSet" : {
-                # REPLACEME
-            }
-        },
-        's:Body': {
-            # REPLACEME
-        }
-    }
-}
+def get_server_certificate(url):
+    addr = (urlparse(url).hostname, urlparse(url).port or 443)
+    cert = ssl.get_server_certificate(addr)
+    cert = cert.removeprefix("-----BEGIN CERTIFICATE-----\n")
+    cert = cert.removesuffix("-----END CERTIFICATE-----\n")
+    return b64decode(cert)
 
+# stolen from https://github.com/jborean93/pyspnego/blob/main/src/spnego/_credssp.py#L127
+def tls_trailer_length(data_length, protocol, cipher_suite):
+    if protocol == "TLSv1.3":
+        trailer_length = 17
+    elif re.match(r"^.*[-_]GCM[-_][\w\d]*$", cipher_suite):
+        trailer_length = 16
+    else:
+        hash_algorithm = cipher_suite.split("-")[-1]
+        hash_length = {"MD5": 16, "SHA": 20, "SHA256": 32, "SHA384": 48}.get(hash_algorithm, 0)
+        pre_pad_length = data_length + hash_length
+        if "RC4" in cipher_suite:
+            padding_length = 0
+        elif "DES" in cipher_suite or "3DES" in cipher_suite:
+            padding_length = 8 - (pre_pad_length % 8)
+        else:
+            padding_length = 16 - (pre_pad_length % 16)
+        trailer_length = (pre_pad_length + padding_length) - data_length
+    return trailer_length
+
+
+# -- missing CredSSP structures: ------------------------------------------------------------------
+class NegoData(univ.Sequence):
+    componentType = namedtype.NamedTypes(
+        _sequence_component("negoToken", 0, univ.OctetString())
+    )
+
+class TSRequest(univ.Sequence):
+    componentType = namedtype.NamedTypes(
+        _sequence_component("version", 0, univ.Integer()),
+        _sequence_optional_component("negoTokens", 1, univ.SequenceOf(componentType=NegoData())),
+        _sequence_optional_component("authInfo", 2, univ.OctetString()),
+        _sequence_optional_component("pubKeyAuth", 3, univ.OctetString()),
+        _sequence_optional_component("errorCode", 4, univ.Integer()),
+        _sequence_optional_component("clientNonce", 5, univ.OctetString())
+    )
+
+    @staticmethod
+    def nego_response(token, version=6):
+        tsreq = TSRequest()
+        tsreq["version"] = version
+        if token:
+            data = NegoData()
+            data["negoToken"] = token
+            tsreq["negoTokens"].extend([data])
+        return tsreq
+
+class TSPasswordCreds(univ.Sequence):
+    componentType = namedtype.NamedTypes(
+        _sequence_component("domainName", 0, univ.OctetString()),
+        _sequence_component("userName", 1, univ.OctetString()),
+        _sequence_component("password", 2, univ.OctetString())
+    )
+
+class TSCredentials(univ.Sequence):
+    componentType = namedtype.NamedTypes(
+        _sequence_component("credType", 0, univ.Integer()),
+        _sequence_component("credentials", 1, univ.OctetString())
+    )
+
+# -- wsman soap helpers: --------------------------------------------------------------------------
 soap_actions = {
     "create"  : "http://schemas.xmlsoap.org/ws/2004/09/transfer/Create",
     "delete"  : "http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete",
@@ -149,130 +166,145 @@ soap_actions = {
     "signal"  : "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal"
 }
 
-# fill in common fields for soap request:
-def soap_req(action, session_id, shell_id=None, timeout=20):
-    message_id = str(uuid.uuid4()).upper()
-    req = deepcopy(soap_req_tmpl)
-    req["s:Envelope"]["s:Header"]["wsa:Action"]["#text"] = soap_actions[action]
-    req["s:Envelope"]["s:Header"]["wsa:MessageID"] = "uuid:" + message_id
-    req["s:Envelope"]["s:Header"]["wsmv:SessionId"]["#text"] = f"uuid:{session_id}"
-    req["s:Envelope"]["s:Header"]["wsman:OperationTimeout"] = f"PT{timeout}S"
-
-    if shell_id:
-        req["s:Envelope"]["s:Header"]["wsman:SelectorSet"] = {
-            "wsman:Selector" : { "@Name" : "ShellId", "#text" : shell_id }
-        }
-
-    return req
-
-# this simplifies the response to only grab the elements i will need:
-def soap_rsp(rsp):
-    action, body = rsp["s:Envelope"]["s:Header"]["a:Action"], rsp["s:Envelope"]["s:Body"]
-    if action.endswith("wsman/fault"):
-        fault = body["s:Fault"]
-        return {
-            "fault"   : action,
-            "subcode" : fault.get("s:Code",   {}).get("s:Subcode", {}).get("s:Value") or "",
-            "reason"  : fault.get("s:Reason", {}).get("s:Text", {}).get("#text") or "",
-            "detail"  : fault.get("s:Detail", {}).get("f:Message") or "",
-        }
-    elif action.endswith("shell/ReceiveResponse"):
-        receive = body["rsp:ReceiveResponse"]
-        streams = receive.get("rsp:Stream", [])
-        if isinstance(streams, dict): # sometimes there's just one stream
-            streams = [ streams ]
-        return {
-            "receive" : action,
-            "streams" : [ b64decode(s.get("#text", "")) for s in streams ],
-            "state"   : receive.get("rsp:CommandState", {}).get("@State") or ""
-        }
-    elif action.endswith("transfer/CreateResponse"):
-        return { "create" : action }
-    elif action.endswith("shell/SignalResponse"):
-        return { "signal" : action }
-    elif action.endswith("transfer/DeleteResponse"):
-        return { "delete" : action }
-    elif action.endswith("shell/CommandResponse"):
-        return { "command" : action }
-    else:
-        return { "unknown" : action, "debug" : rsp } # for debugging
-
-
-# -- PSObjects: -----------------------------------------------------------------------------------
-# bare minimum to create relevant ps remoting objects:
-ps_nil  = lambda n    : { "Nil"     : { "@N" : n } }
-ps_int  = lambda n, v : { "I32"     : { "@N" : n, "#text" : str(v) } }
-ps_str  = lambda n, v : { "S"       : { "@N" : n, "#text" : v } }
-ps_ver  = lambda n, v : { "Version" : { "@N" : n, "#text" : v } }
-ps_bool = lambda n, v : { "B"       : { "@N" : n, "#text" : str(bool(v)).lower()} }
-ps_obj  = lambda n, v : { "Obj"     : { "@N" : n, "MS" : v } }
-ps_enum = lambda n, v : { "Obj"     : { "@N" : n, "I32" : v } }
-ps_smap = lambda elms : { "Obj"     : { "MS" : elms } }
-
-ps_list = lambda name, kind, elements : {
-    "Obj" : {
-        "@N" : name,
-        "LST" : { kind : [ el[kind] for el in elements ] }
-    }
+soap_ns = {
+    "s"     : "http://www.w3.org/2003/05/soap-envelope",
+    "a"     : "http://schemas.xmlsoap.org/ws/2004/08/addressing",
+    "rsp"   : "http://schemas.microsoft.com/wbem/wsman/1/windows/shell",
+    "wsman" : "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd",
+    "wsmv"  : "http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd",
 }
 
-ps_session_capability = ps_smap([
-    ps_ver("protocolversion", "2.3"),
-    ps_ver("PSVersion", "2.0"),
-    ps_ver("SerializationVersion", "1.1.0.10")
+def xml_get_text(root, xpath, default=None):
+    el = root.find(xpath, soap_ns)
+    if el is None:
+        return default
+    elif el.text is None:
+        return default
+    else:
+        return utfstr(el.text)
+
+def xml_get_attrib(root, xpath, attrib, default=None):
+    el = root.find(xpath, soap_ns)
+    if el is None:
+        return default
+    else:
+        return el.get(attrib) or default
+
+# fill in common fields for soap request:
+def soap_req(action, session_id, shell_id=None, timeout=1):
+    message_id = str(uuid.uuid4()).upper()
+    must_undestand = lambda v=True: { "s:mustUnderstand" : str(v).lower() }
+
+    envelope = ET.Element("s:Envelope", { f"xmlns:{ns}" : uri for ns, uri in soap_ns.items() })
+    header   = ET.SubElement(envelope, "s:Header")
+    body     = ET.SubElement(envelope, "s:Body")
+
+    ET.SubElement(header, "wsman:ResourceURI", must_undestand()).text \
+        = "http://schemas.microsoft.com/powershell/Microsoft.PowerShell"
+
+    ET.SubElement(ET.SubElement(header, "a:ReplyTo"), "a:Address", must_undestand()).text \
+        = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
+
+    ET.SubElement(header, "a:To").text = "http://localhost"
+    ET.SubElement(header, "a:Action", must_undestand()).text = soap_actions[action]
+    ET.SubElement(header, "a:MessageID").text = f"uuid:{message_id}"
+    ET.SubElement(header, "wsman:MaxEnvelopeSize", must_undestand()).text = "64000"
+    ET.SubElement(header, "wsman:OperationTimeout").text = f"PT{timeout}S"
+    ET.SubElement(header, "wsman:OptionSet", must_undestand())
+    ET.SubElement(header, "wsmv:SessionId", must_undestand(False)).text = f"uuid:{session_id}"
+
+    selector = ET.SubElement(header, "wsman:SelectorSet")
+    if shell_id:
+        ET.SubElement(selector, "wsman:Selector", { "Name": "ShellId" }).text = shell_id
+
+    return envelope
+
+# -- PSObjects: -----------------------------------------------------------------------------------
+# bare minimum to get a basic shell going:
+def ps_simple(name, kind, value):
+    el = ET.Element(kind, { "N" : name })
+    if value is not None:
+        el.text = str(value)
+    return el
+
+def ps_enum(name, value):
+    obj = ET.Element("Obj", { "N" : name })
+    ET.SubElement(obj, "I32").text = str(value)
+    return obj
+
+def ps_struct(name, elements):
+    obj = ET.Element("Obj", ({ "N" : name } if name else {}))
+    ET.SubElement(obj, "MS").extend(elements)
+    return obj
+
+def ps_list(name, elements):
+    obj = ET.Element("Obj", { "N" : name })
+    ET.SubElement(obj, "LST").extend(elements)
+    return obj
+
+ps_capability = ps_struct(None, [
+    ps_simple("protocolversion",      "Version", "2.1"),
+    ps_simple("PSVersion",            "Version", "2.0"),
+    ps_simple("SerializationVersion", "Version", "1.1.0.10")
 ])
 
-ps_host_info = ps_obj("HostInfo", [
-    ps_bool("_isHostNull",      True),
-    ps_bool("_isHostUINull",    True),
-    ps_bool("_isHostRawUINull", True),
-    ps_bool("_useRunspaceHost", True)
-])
-
-ps_runspace_pool = ps_smap([
-    ps_int("MinRunspaces", 1),
-    ps_int("MaxRunspaces", 1),
+ps_runspace_pool = ps_struct(None, [
+    ps_simple("MinRunspaces", "I32", 1),
+    ps_simple("MaxRunspaces", "I32", 1),
     ps_enum("PSThreadOptions", 0),
     ps_enum("ApartmentState",  2),
-    ps_host_info,
-    ps_nil("ApplicationArguments")
+    ps_struct("HostInfo", [
+        ps_simple("_isHostNull",      "B", "true"),
+        ps_simple("_isHostUINull",    "B", "true"),
+        ps_simple("_isHostRawUINull", "B", "true"),
+        ps_simple("_useRunspaceHost", "B", "true")
+    ]),
+    ps_simple("ApplicationArguments", "Nil", None)
 ])
 
 ps_args = lambda args: [
-    ps_smap([ ps_str("N", k), ps_str("V", v) if v else ps_nil("V") ]) for k, v in args.items()
+    ps_struct(None, [
+        ps_simple("N", "S", k),
+        ps_simple("V", "S" if v else "Nil", v)
+    ]) for k, v in args.items()
 ]
 
-ps_command = lambda cmd, args : ps_smap([
-    ps_str("Cmd", cmd),
-    ps_list("Args", "Obj", ps_args(args)),
-    ps_bool("IsScript", False),
-    ps_nil("UseLocalScope"),
-    ps_enum("MergeMyResult", 0),
-    ps_enum("MergeToResult", 0),
+ps_command = lambda cmd, args : ps_struct(None, [
+    ps_simple("Cmd", "S", cmd),
+    ps_list("Args", ps_args(args)),
+    ps_simple("IsScript", "B", "false"),
+    ps_simple("UseLocalScope", "Nil", None),
+    # these are PipelineResultTypes::None (Default streaming behavior):
+    ps_enum("MergeMyResult",        0),
+    ps_enum("MergeToResult",        0),
     ps_enum("MergePreviousResults", 0),
-    ps_enum("MergeError", 0),
-    ps_enum("MergeWarning", 0),
-    ps_enum("MergeVerbose", 0),
-    ps_enum("MergeDebug", 0),
-    ps_enum("MergeInformation", 0),
+    ps_enum("MergeError",           0),
+    ps_enum("MergeWarning",         0),
+    ps_enum("MergeVerbose",         0),
+    ps_enum("MergeDebug",           0),
+    ps_enum("MergeInformation",     0),
 ])
 
-ps_create_pipeline = lambda commands : ps_smap([
-    ps_bool("NoInput", True),
-    ps_bool("AddToHistory", False),
-    ps_bool("IsNested", False),
-    ps_enum("ApartmentState", 2),
-    ps_enum("RemoteStreamOptions", 15),
-    ps_host_info,
-    ps_obj("PowerShell", [
-        ps_bool("IsNested", False),
-        ps_bool("RedirectShellErrorOutputPipe", False),
-        ps_nil("ExtraCmds"),
-        ps_nil("History"),
-        ps_list("Cmds", "Obj", [ ps_command(cmd, args) for cmd, args in commands ])
+ps_create_pipeline = lambda commands : ps_struct(None, [
+    ps_simple("NoInput",      "B", "true"),
+    ps_simple("AddToHistory", "B", "false"),
+    ps_simple("IsNested",     "B", "false"),
+    ps_enum("ApartmentState", 2),       # Unknown
+    ps_enum("RemoteStreamOptions", 15), # AddInvocationInfo
+    ps_struct("HostInfo", [
+        ps_simple("_isHostNull",      "B", "true"),
+        ps_simple("_isHostUINull",    "B", "true"),
+        ps_simple("_isHostRawUINull", "B", "true"),
+        ps_simple("_useRunspaceHost", "B", "true")
+    ]),
+    ps_struct("PowerShell", [
+        ps_simple("IsNested", "B", "false"),
+        ps_simple("RedirectShellErrorOutputPipe", "B", "false"),
+        ps_simple("ExtraCmds", "Nil", None),
+        ps_simple("History", "Nil", None),
+        ps_list("Cmds", commands)
     ])
 ])
-
 
 # -- message framing: -----------------------------------------------------------------------------
 msg_ids = {
@@ -313,7 +345,7 @@ for k, v in msg_ids.items():
     globals()[v] = k
 
 def fragment(next_obj_id, messages):
-    # this doesn't do proper fragmentation over multiple wxf:Send requests, but my
+    # this doesn't do proper fragmentation over multiple Send requests, but my
     # thinking here is that i'm *sending* only smallish messages, so i can get away
     # with it; defragment() does it properly because server responses can get very large:
     fragments = b""
@@ -323,11 +355,11 @@ def fragment(next_obj_id, messages):
         this += pack("<I", msg_type)
         this += uuid.UUID(rpid).bytes_le
         this += uuid.UUID(pid).bytes_le
-        this += data
+        this += ET.tostring(data)
 
         fragments += pack(">Q", next_obj_id) # object_id
         fragments += pack(">Q", 0)           # fragment_id
-        fragments += pack(">B", 0x1 | 0x2)   # pray message fits in this fragment
+        fragments += pack(">B", 0x1 | 0x2)
         fragments += pack(">I", len(this))
         fragments += this
 
@@ -367,388 +399,522 @@ def defragment(streams, object_buffer):
             _, msg_type = unpack("<II", frag[:8])
             rpid = str(uuid.UUID(bytes_le=frag[8:24])).upper()
             pid  = str(uuid.UUID(bytes_le=frag[24:40])).upper()
-            msg  = deserialize(frag[40:].decode())
+            msg  = ET.fromstring(frag[40:])
             yield (msg_type, msg, rpid, pid)
 
+
 # -- transports: ----------------------------------------------------------------------------------
-class BasicTransport:
-    def __init__(self, url, username, password):
-        self.session = Session()
-        self.session.verify = False
-        self.session.headers["User-Agent"] = SKIP_HEADER
-        self.session.headers["Accept-Encoding"] = SKIP_HEADER
-        self.url  = url
-        self.auth = (username, password)
+class TransportError(Exception):
+    pass
 
-    def send(self, req):
-        rsp = self.session.post(self.url, auth=self.auth, data=req, headers={
-            "Content-Type" : "application/soap+xml;charset=UTF-8"
-        })
-        return rsp.content
+class SPNEGOError(Exception):
+    pass
 
-class NTLMTransport:
-    def __init__(self, url, username, password="", nt_hash=""):
-        self.url      = url
+class NTCredential:
+    def __init__(self, domain, username, password="", nt_hash=""):
+        self.domain = domain
         self.username = username
         self.password = password
-        self.nt_hash  = nt_hash
-        self.ssl = urlparse(url).scheme == "https"
-        self.session  = None
+        self.nt_hash = nt_hash
 
-        if self.ssl:
-            cert = ssl.get_server_certificate((urlparse(url).hostname, urlparse(url).port or 443))
-            cert = cert.removeprefix("-----BEGIN CERTIFICATE-----\n")
-            cert = cert.removesuffix("-----END CERTIFICATE-----\n")
-            cert = SHA256.new(b64decode(cert)).digest()
-            app_data = b"tls-server-end-point:" + cert
-            self.gss_bindings = MD5.new(bytes(16) + pack("<I", len(app_data)) + app_data).digest()
+class KrbCredential:
+    def __init__(self, domain, username, ticket, tgskey, password=""):
+        self.domain = domain
+        self.username = username
+        self.password = password # for CredSSP only
+        self.ticket = ticket
+        self.tgskey = tgskey
 
-    def send(self, req):
-        if self.session is None:
-            self._auth()
+class SPNEGOProxyNTLM:
+    def __init__(self, creds, gss_bindings=None):
+        self.creds = creds
+        self.gss_bindings = gss_bindings
+        self.complete = False
 
-        rsp = self._send(req)
-        if rsp.status_code == 401:
-            logging.debug("server asked to reauth")
-            self._auth()
-            rsp = self._send(req)
+    def step(self, data_in=None):
+        if data_in is None:
+            self._type1 = getNTLMSSPType1()
+            self._type1["flags"] = 0xe0088237 # wiresharked
+            init = SPNEGO_NegTokenInit()
+            init["MechTypes"] = [ TypesMech["NTLMSSP - Microsoft NTLM Security Support Provider"] ]
+            init["MechToken"] = self._type1.getData()
+            return init.getData()
 
-        if rsp.status_code == 401:
-            raise RuntimeError("failed to reauth")
+        try:
+            targ = SPNEGO_NegTokenResp(data_in)
+            neg_state = targ["NegState"][0]
+        except:
+            raise TransportError("SPNEGO: bad response")
 
-        if rsp.status_code not in (200, 500):
-            raise RuntimeError("unexcpected response")
+        if neg_state == 0: # accept-completed
+            self.complete = True
 
-        return rsp.content
+        elif neg_state == 1: # accept-incomplete
+            type2 = targ["ResponseToken"] # NTLMAuthChallenge
 
-    def _send(self, req):
-        prefix   = b"Content-Type: application/octet-stream\r\n"
-        suffix   = b"--Encrypted Boundary--\r\n"
-        protocol = "application/HTTP-SPNEGO-session-encrypted"
+            if self.gss_bindings:
+                chal = NTLMAuthChallenge(type2)
+                info = AV_PAIRS(chal['TargetInfoFields'])
+                info[NTLMSSP_AV_CHANNEL_BINDINGS] = self.gss_bindings
+                chal["TargetInfoFields"]          = info.getData()
+                chal["TargetInfoFields_len"]      = len(info.getData())
+                chal["TargetInfoFields_max_len"]  = len(info.getData())
+                type2 = chal.getData()
 
+            nt_hash = bytes.fromhex(self.creds.nt_hash) if self.creds.nt_hash else ""
+            type3, key = getNTLMSSPType3(self._type1, type2, self.creds.username,
+                                         self.creds.password, "", "", nt_hash)
+
+            resp = SPNEGO_NegTokenResp()
+            resp["NegState"] = b"\x01"
+            resp["SupportedMech"] = b""
+            resp["ResponseToken"] = type3.getData()
+
+            self.msgseq  = 0
+            self.key_cli = SIGNKEY(type3["flags"], key, "Client")
+            self.key_srv = SIGNKEY(type3["flags"], key, "Server")
+            self.rc4_cli = ARC4.new(SEALKEY(type3["flags"], key, "Client"))
+            self.rc4_srv = ARC4.new(SEALKEY(type3["flags"], key, "Server"))
+            return resp.getData()
+
+        elif neg_state == 2: # reject
+            raise SPNEGOError("NTLM rejected")
+
+        else: # if neg_state == 3 (request-mic)
+            raise NotImplementedError("request-mic")
+
+    def wrap(self, req, joined=False):
         seq = pack("<I", self.msgseq)
         enc = self.rc4_cli.encrypt(req)
         sig = HMAC.new(self.key_cli, seq + req, digestmod=MD5).digest()[:8]
         sig = pack("<I", 1) + self.rc4_cli.encrypt(sig) + seq
+        self.msgseq += 1
+        return (sig + enc) if joined else (sig, enc)
 
-        data  = b"--Encrypted Boundary\r\n"
-        data += f"Content-Type: {protocol}\r\n".encode()
-        data += f"OriginalContent: type=application/soap+xml;charset=UTF-8;Length={len(req)}\r\n".encode()
-        data += b"--Encrypted Boundary\r\n"
-        data += prefix + pack("<I", len(sig)) + sig + enc + suffix
+    def unwrap(self, sig, enc):
+        plaintext = self.rc4_srv.decrypt(enc)
+        seq = pack("<I", self.msgseq - 1)
+        sig_test = HMAC.new(self.key_srv, seq + plaintext, digestmod=MD5).digest()[:8]
+        sig_test = self.rc4_srv.decrypt(sig_test)
+        if sig[4:12] != sig_test:
+            raise SPNEGOError("unwrap(): message integrity failure")
+        return plaintext
 
-        rsp = self.session.post(self.url, data=data, headers={
-            "Content-Type" : f'multipart/encrypted;protocol="{protocol}";boundary="Encrypted Boundary"'
-        })
 
-        if rsp.status_code not in (200, 500):
-            return rsp
+class SPNEGOProxyKerberos:
+    def __init__(self, creds, gss_bindings=None):
+        self.creds = creds
+        self.gss_bindings = gss_bindings
+        self.complete = False
+
+    def step(self, data_in=None):
+        if data_in is None:
+            user = Principal(self.creds.username, type=PrincipalNameType.NT_PRINCIPAL.value)
+            cipher = _enctype_table[self.creds.tgskey.enctype]
+
+            checksum = CheckSumField()
+            checksum['Lgth']  = 16
+            checksum['Flags'] = GSS_C_CONF_FLAG|GSS_C_INTEG_FLAG|GSS_C_SEQUENCE_FLAG|GSS_C_MUTUAL_FLAG
+            if self.gss_bindings:
+                checksum['Bnd'] = self.gss_bindings
+
+            now = datetime.now(UTC)
+            auth = Authenticator()
+            seq_set(auth, 'cname', user.components_to_asn1)
+            auth['authenticator-vno']  = 5
+            auth['crealm']             = self.creds.domain.upper()
+            auth['cusec']              = now.microsecond
+            auth['ctime']              = KerberosTime.to_asn1(now)
+            auth['cksum']              = noValue
+            auth['cksum']['cksumtype'] = 0x8003
+            auth['cksum']['checksum']  = checksum.getData()
+            auth['seq-number']         = 0
+            # include a dummy subkey here with enctype=18 so that when in AP_REP when application
+            # returns *it's* subkey it will have this enctype too, otherwise it will have
+            # the same enctype as tgskey (eg 23) and WinRM can only work with AES (?):
+            auth['subkey'] = noValue
+            auth['subkey']['keyvalue'] = randbytes(32)
+            auth['subkey']['keytype']  = 18
+            enc_auth = cipher.encrypt(self.creds.tgskey, 11, encoder.encode(auth), None)
+
+            ap_req = AP_REQ()
+            ap_req['pvno']          = 5
+            ap_req['msg-type']      = int(ApplicationTagNumbers.AP_REQ.value)
+            ap_req['ap-options']    = encodeFlags([2]) # mutual-required
+            ap_req['authenticator'] = noValue
+            ap_req['authenticator']['etype'] = cipher.enctype
+            ap_req['authenticator']['cipher'] = enc_auth
+            seq_set(ap_req, 'ticket', self.creds.ticket.to_asn1)
+
+            init = SPNEGO_NegTokenInit()
+            init["MechTypes"] = [ TypesMech["MS KRB5 - Microsoft Kerberos 5" ] ]
+            init["MechToken"] = encoder.encode(ap_req)
+            return init.getData()
 
         try:
-            assert b"application/soap+xml;charset=UTF-8" in rsp.content
-            body = between(rsp.content, prefix, suffix)
-            assert unpack("<II", body[:8]) == (16, 1) # length, version
-            assert body[16:20] == seq                 # message sequence
+            targ = SPNEGO_NegTokenResp(data_in)
+            neg_state = targ["NegState"][0]
         except:
-            raise RuntimeError("failed to parse response")
+            raise SPNEGOError("Kerberos: unexpected response")
 
-        plaintext = self.rc4_srv.decrypt(body[20:])
+        if neg_state == 0: # accept-completed
+            blob    = krb5_mech_indep_token_decode(targ["ResponseToken"])[1]
+            ap_rep  = decoder.decode(blob[2:], asn1Spec=AP_REP())[0]
+            cipher  = _enctype_table[self.creds.tgskey.enctype]
+            rep_enc = cipher.decrypt(self.creds.tgskey, 12, ap_rep["enc-part"]["cipher"])
+            rep_dec = decoder.decode(rep_enc, asn1Spec=EncAPRepPart())[0]
 
-        sig0 = body[8:16]
-        sig1 = HMAC.new(self.key_srv, seq + plaintext, digestmod=MD5).digest()[:8]
-        sig1 = self.rc4_srv.decrypt(sig1)
+            keydata = rep_dec["subkey"]["keyvalue"].asOctets()
+            keytype = rep_dec["subkey"]["keytype"]
 
-        if sig0 != sig1:
-            raise RuntimeError("failed to verify response signature")
+            self.subkey   = Key(keytype, keydata)
+            self.cipher   = _enctype_table[keytype]
+            self.seq_cli  = 0
+            self.seq_srv  = int(rep_dec["seq-number"])
+            self.complete = True
 
-        self.msgseq += 1
-        rsp.headers["Content-Type"] = "application/soap+xml;charset=UTF-8"
-        rsp.headers["Content-Length"] = str(len(plaintext))
-        rsp._content = plaintext
-        return rsp
+        elif neg_state == 1: # accept-incomplete
+            # this is probably for GSS_C_DCE_STYLE... it would expect one more
+            # client->server message after AP_REP (?)
+            raise SPNEGOError("Kerberos: unexpected response")
 
-    def _auth(self, url=None):
-        session = Session()
-        session.verify = False
-        session.headers["User-Agent"] = SKIP_HEADER
-        session.headers["Accept-Encoding"] = SKIP_HEADER
+        elif neg_state == 2: # reject
+            raise SPNEGOError("Kerberos: rejected")
 
-        type1 = getNTLMSSPType1()
-        type1["flags"] = 0xe0088237 # wiresharked
-        type1_token = "Negotiate " + b64str(type1.getData())
+        else: # request-mic
+            raise NotImplementedError("request-mic")
 
-        rsp = session.post(self.url, headers={ "Authorization" : type1_token })
+    def wrap(self, req, joined=False):
+        sig = bytearray(pack(">BBBBHHQ", 5, 4, 6, 0xff, 0, 0, self.seq_cli))
+        enc = self.cipher.encrypt(self.subkey, KG_USAGE_INITIATOR_SEAL, req + sig, None)
+        rot = len(enc) - (28 % len(enc))
+        enc = enc[rot:] + enc[:rot]
+        sig[7] = 28 # too lazy to make that WrapToken structure just to set one value
+        self.seq_cli += 1
+        return sig + enc if joined else (sig + enc[:44], enc[44:])
 
-        www_auth = rsp.headers.get("WWW-Authenticate", "")
-        if not www_auth.startswith("Negotiate "):
-            raise RuntimeError("NTLM auth failed")
+    def unwrap(self, sig, enc):
+        _, _, _, _, ec, rrc, seq_srv = unpack(">BBBBHHQ", sig[:16])
+        if seq_srv != self.seq_srv:
+            raise SPNEGOError("Kerberos: replay")
 
-        type2 = b64decode(www_auth.removeprefix("Negotiate "))
-
-        # include tls channel bindings in case CbtHardeningLevel=Strict
-        if self.ssl:
-            chal = NTLMAuthChallenge(type2)
-            info = AV_PAIRS(chal['TargetInfoFields'])
-            info[NTLMSSP_AV_CHANNEL_BINDINGS] = self.gss_bindings
-            chal["TargetInfoFields"]          = info.getData()
-            chal["TargetInfoFields_len"]      = len(info.getData())
-            chal["TargetInfoFields_max_len"]  = len(info.getData())
-            type2 = chal.getData()
-
-        nt_hash = bytes.fromhex(self.nt_hash) if self.nt_hash else ""
-        type3, key = getNTLMSSPType3(type1, type2, self.username, self.password, "", "", nt_hash)
-
-        type3_token = "Negotiate " + b64str(type3.getData())
-        rsp = session.post(self.url, headers= { "Authorization" : type3_token })
-
-        flags = type3["flags"]
-
-        self.session = session
-        self.msgseq  = 0
-        self.key_cli = SIGNKEY(flags, key, "Client")
-        self.key_srv = SIGNKEY(flags, key, "Server")
-        self.rc4_cli = ARC4.new(SEALKEY(flags, key, "Client"))
-        self.rc4_srv = ARC4.new(SEALKEY(flags, key, "Server"))
+        self.seq_srv += 1
+        enc = sig[16:] + enc
+        rot = (rrc + ec) % len(enc)
+        enc = enc[rot:] + enc[:rot]
+        plaintext = self.cipher.decrypt(self.subkey, KG_USAGE_ACCEPTOR_SEAL, enc)
+        return plaintext[:-(ec + 16)]
 
 
-class KerberosTransport:
-    def __init__(self, url, dc_ip, spn, domain, username, password="", nt_hash="", aes_key=""):
-        self.url      = url
-        self.ssl      = urlparse(url).scheme == "https"
-        self.domain   = domain
-        self.username = username
-        self.password = password
-        self.nt_hash  = nt_hash
-        self.aes_key  = aes_key
-        self.session  = None
-
-        user = Principal(username, type=PrincipalNameType.NT_PRINCIPAL.value)
-        http = Principal(spn,      type=PrincipalNameType.NT_PRINCIPAL.value)
-
-        tgt, tgs = None, None
-
-        if os.getenv("KRB5CCNAME"):
-            _, _, tgt, tgs = CCache.parseFile(target=spn)
-            if tgt and not tgs:
-                cipher = tgt['cipher']
-                tgtkey = tgt['sessionKey']
-                tgt    = tgt['KDC_REP']
-            elif tgs:
-                cipher = tgs['cipher']
-                tgskey = tgs['sessionKey']
-                tgs    = tgs['KDC_REP']
-        else:
-            logging.info(f"requesting TGT for {domain}\\{username}")
-            tgt, cipher, _, tgtkey = getKerberosTGT(user, password, domain, "", nt_hash, aes_key, dc_ip)
-
-        if not tgt and not tgs:
-            raise KerberosError("Could not get TGT or TGS")
-
-        if not tgs:
-            logging.info(f"requesting TGS for {spn}")
-            tgs, cipher, _, tgskey = getKerberosTGS(http, domain, dc_ip, tgt, cipher, tgtkey)
-
-        ticket = Ticket()
-        ticket.from_asn1(decoder.decode(tgs, asn1Spec=TGS_REP())[0]["ticket"])
-
-        self.tgs_ticket = ticket
-        self.tgs_cipher = cipher
-        self.tgs_key    = tgskey
-
-        if self.ssl:
-            cert = ssl.get_server_certificate((urlparse(url).hostname, urlparse(url).port or 443))
-            cert = cert.removeprefix("-----BEGIN CERTIFICATE-----\n")
-            cert = cert.removesuffix("-----END CERTIFICATE-----\n")
-            cert = SHA256.new(b64decode(cert)).digest()
-            app_data = b"tls-server-end-point:" + cert
-            self.gss_bindings = MD5.new(bytes(16) + pack("<I", len(app_data)) + app_data).digest()
+class Transport:
+    def __init__(self, url):
+        self.url = url
+        self.ssl = urlparse(url).scheme == "https"
+        self.session = Session()
+        self.session.verify = False
+        self.session.headers["User-Agent"] = SKIP_HEADER
+        self.session.headers["Accept-Encoding"] = SKIP_HEADER
 
     def send(self, req):
-        if self.session is None:
-            self._auth()
+        rsp = self._send(req) # implement _send() in subclasses
 
-        rsp = self._send(req)
         if rsp.status_code == 401:
-            logging.debug("server asked to reauth")
-            self._auth()
+            self._auth()      # implement _auth() in subclasses
             rsp = self._send(req)
 
-        if rsp.status_code == 401:
-            raise RuntimeError("failed to reauth")
-
         if rsp.status_code not in (200, 500):
-            raise RuntimeError("unexcpected response")
+            raise TransportError(f"unexcpected response: {rsp.status_code}")
 
         return rsp.content
 
-    def _send(self, req):
-        gss = GSSAPI(self.cipher)
-        r0, r1 = gss.GSS_Wrap(self.subkey, req, self.msgseq)
+    # -- helper methods common to CredSSP/SPNEGO/Kerberos: ----------------------------------------
+    def _send_auth(self, req, proto, phase=""):
+        rsp = self.session.post(self.url, headers={ "Authorization" : f"{proto} {b64str(req)}" })
+        www_auth = rsp.headers.get("WWW-Authenticate", "")
 
+        if rsp.status_code == 200 and not www_auth:
+            return b""
+        elif not www_auth.startswith(f"{proto} "):
+            raise TransportError(f"{proto}: {phase}")
+
+        return b64decode(www_auth.removeprefix(f"{proto} "))
+
+    def _encrypted_request(self, sig, enc, orig_len, proto):
         prefix   = b"Content-Type: application/octet-stream\r\n"
         suffix   = b"--Encrypted Boundary--\r\n"
-        protocol = "application/HTTP-Kerberos-session-encrypted"
+        protocol = f"application/HTTP-{proto}-session-encrypted"
 
         data  = b"--Encrypted Boundary\r\n"
         data += f"Content-Type: {protocol}\r\n".encode()
-        data += f"OriginalContent: type=application/soap+xml;charset=UTF-8;Length={len(req)}\r\n".encode()
+        data += f"OriginalContent: type=application/soap+xml;charset=UTF-8;Length={orig_len}\r\n".encode()
         data += b"--Encrypted Boundary\r\n"
-        data += prefix + pack("<I", len(r1)) + r1 + r0 + suffix
+        data += prefix + pack("<I", len(sig)) + sig + enc + suffix
 
-        rsp = self.session.post(self.url, verify=False, data=data, headers={
-            "Content-Type" : f'multipart/encrypted;protocol="{protocol}";boundary="Encrypted Boundary"'
-        })
+        return data, f'multipart/encrypted;protocol="{protocol}";boundary="Encrypted Boundary"'
 
+    def _decrypted_response(self, rsp, unwrap):
         if rsp.status_code not in (200, 500):
             return rsp
 
-        try:
-            assert b"application/soap+xml;charset=UTF-8" in rsp.content
-            body = between(rsp.content, prefix, suffix)
-        except:
-            raise RuntimeError("failed to parse response")
+        prefix = b"\r\nContent-Type: application/octet-stream\r\n"
+        plaintext = b""
+        for body in rsp.content.split(b"--Encrypted Boundary"):
+            if not body.startswith(prefix):
+                continue
+            body = body.removeprefix(prefix)
+            sig_len = unpack("<I", body[:4])[0]
+            plaintext += unwrap(body[4:4+sig_len], body[4+sig_len:])
 
-        try:
-            hdr_size  = unpack("<I", body[:4])[0]
-            hdr_data  = body[4:][:hdr_size]
-            enc_data  = body[4:][hdr_size:]
-            hdr_data  = bytes(8) + hdr_data # extra bytes are a hack to reuse GSS_Unwrap() for WinRM
-            plaintext = gss.GSS_Unwrap(self.subkey, enc_data, self.msgseq, 'accept', True, hdr_data)[0]
-        except:
-            raise RuntimeError("failed to decrypt response")
-
-        self.msgseq += 1
         rsp.headers["Content-Type"] = "application/soap+xml;charset=UTF-8"
         rsp.headers["Content-Length"] = str(len(plaintext))
         rsp._content = plaintext
         return rsp
 
+
+class BasicTransport(Transport):
+    def __init__(self, url, username, password):
+        super().__init__(url)
+        self.session.auth = (username, password)
+
+    def _send(self, req):
+        return self.session.post(self.url, data=req, headers={
+            "Content-Type" : "application/soap+xml;charset=UTF-8"
+        })
+
     def _auth(self):
-        user = Principal(self.username, type=PrincipalNameType.NT_PRINCIPAL.value)
+        pass
 
-        checksum = CheckSumField()
-        checksum['Lgth']   = 16
-        checksum['Flags']  = GSS_C_CONF_FLAG | GSS_C_INTEG_FLAG | GSS_C_SEQUENCE_FLAG
-        checksum['Flags'] |= GSS_C_REPLAY_FLAG | GSS_C_MUTUAL_FLAG
-        # include tls channel binding in case CbtHardeningLevel=Strict
+
+class ClientCertTransport(Transport):
+    def __init__(self, url, cert_pem, cert_key):
+        super().__init__(url)
+        self.session.cert = (cert_pem, cert_key)
+        self.session.headers["Authorization"] \
+            = "http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual"
+
+    def _send(self, req):
+        return self.session.post(self.url, data=req, headers={
+            "Content-Type" : "application/soap+xml;charset=UTF-8"
+        })
+
+    def _auth(self):
+        pass
+
+
+class SPNEGOTransport(Transport):
+    def __init__(self, url, creds):
+        super().__init__(url)
+        self.creds = creds
+
         if self.ssl:
-            checksum['Bnd'] = self.gss_bindings
+            cert = SHA256.new(get_server_certificate(url)).digest()
+            app_data = b"tls-server-end-point:" + cert
+            self.gss_bindings = MD5.new(bytes(16) + pack("<I", len(app_data)) + app_data).digest()
+        else:
+            self.gss_bindings = None
 
-        now = datetime.now(UTC)
+        self._auth()
 
-        auth = Authenticator()
-        seq_set(auth, 'cname', user.components_to_asn1)
-        auth['authenticator-vno']  = 5
-        auth['crealm']             = self.domain
-        auth['cusec']              = now.microsecond
-        auth['ctime']              = KerberosTime.to_asn1(now)
-        auth['cksum']              = noValue
-        auth['cksum']['cksumtype'] = 0x8003
-        auth['cksum']['checksum']  = checksum.getData()
-        # include a dummy subkey here with enctype=18 so that when in AP_REP when application
-        # returns *it's* subkey it will have this enctype too, otherwise it will have
-        # the same enctype as tgskey (eg 23) and WinRM can only work with AES:
-        auth['subkey'] = noValue
-        auth['subkey']['keyvalue'] = randbytes(32)
-        auth['subkey']['keytype']  = 18
-        enc_auth = self.tgs_cipher.encrypt(self.tgs_key, 11, encoder.encode(auth), None)
+    def _send(self, req):
+        sig, enc = self.proxy.wrap(req)
+        data, content_type = self._encrypted_request(sig, enc, len(req), "SPNEGO")
+        rsp = self.session.post(self.url, data=data, headers={ "Content-Type" : content_type })
+        return self._decrypted_response(rsp, self.proxy.unwrap)
 
-        ap_req = AP_REQ()
-        ap_req['pvno']       = 5
-        ap_req['msg-type']   = int(ApplicationTagNumbers.AP_REQ.value)
-        ap_req['ap-options'] = encodeFlags([2]) # mutual-required
-        ap_req['authenticator'] = noValue
-        ap_req['authenticator']['etype'] = self.tgs_cipher.enctype
-        ap_req['authenticator']['cipher'] = enc_auth
-        seq_set(ap_req, 'ticket', self.tgs_ticket.to_asn1)
+    def _auth(self):
+        if isinstance(self.creds, NTCredential):
+            self.proxy = SPNEGOProxyNTLM(self.creds, self.gss_bindings)
+        else:
+            self.proxy = SPNEGOProxyKerberos(self.creds, self.gss_bindings)
 
-        # -- "Authorization" token for http request: ----------------------------------------------
-        token = KRB5_AP_REQ + encoder.encode(ap_req)
-        token = krb5_mech_indep_token_encode("1.2.840.113554.1.2.2", token)
-        token = "Kerberos " + b64str(token)
+        token_out = self.proxy.step()
+        while not self.proxy.complete:
+            token_in = self._send_auth(token_out, "Negotiate", "SPNEGO")
+            token_out = self.proxy.step(token_in)
 
-        # -- ask for AP_REP via HTTP: -------------------------------------------------------------
-        session = Session()
-        session.verify = False
-        session.headers["User-Agent"] = SKIP_HEADER
-        session.headers["Accept-Encoding"] = SKIP_HEADER
-        rsp = session.post(self.url, headers={ "Authorization" : token })
-        www_auth = rsp.headers.get("WWW-Authenticate", "")
 
-        try:
-            assert www_auth.startswith("Kerberos ")
-            www_auth = www_auth.removeprefix("Kerberos ")
-            krb_blob = krb5_mech_indep_token_decode(b64decode(www_auth))[1]
-            ap_rep   = decoder.decode(krb_blob[2:], asn1Spec=AP_REP())[0]
-        except:
-            raise RuntimeError("Kerberos auth failed")
+class KerberosTransport(Transport):
+    def __init__(self, url, creds):
+        super().__init__(url)
+        self.creds = creds
 
-        ap_rep_enc = self.tgs_cipher.decrypt(self.tgs_key, 12, ap_rep["enc-part"]["cipher"])
-        ap_rep_dec = decoder.decode(ap_rep_enc, asn1Spec=EncAPRepPart())[0]
-        keydata    = ap_rep_dec["subkey"]["keyvalue"].asOctets()
-        keytype    = ap_rep_dec["subkey"]["keytype"]
+        if self.ssl:
+            cert = SHA256.new(get_server_certificate(url)).digest()
+            app_data = b"tls-server-end-point:" + cert
+            self.gss_bindings = MD5.new(bytes(16) + pack("<I", len(app_data)) + app_data).digest()
+        else:
+            self.gss_bindings = None
 
-        self.subkey  = Key(keytype, keydata)
-        self.cipher  = _enctype_table[keytype] # 18
-        self.session = session
-        self.msgseq  = 0
+        self._auth()
 
+    def _send(self, req):
+        sig, enc = self.proxy.wrap(req)
+        data, content_type = self._encrypted_request(sig, enc, len(req), "Kerberos")
+        rsp = self.session.post(self.url, data=data, headers={ "Content-Type" : content_type })
+        return self._decrypted_response(rsp, self.proxy.unwrap)
+
+    def _auth(self):
+        # here i hijack implementation from SPNEGOProxyKerberos, because it can already gereate
+        # AP_REQ and has wrap/unwrap functions. I just need to extract AP_REQ from
+        # SPNEGO_NegTokenInit and then put response back into SPNEGO_NegTokenResp:
+        self.proxy = SPNEGOProxyKerberos(self.creds, self.gss_bindings)
+        init = self.proxy.step()
+        ap_req = SPNEGO_NegTokenInit(init)["MechToken"]
+        ap_req = krb5_mech_indep_token_encode("1.2.840.113554.1.2.2", KRB5_AP_REQ + ap_req)
+
+        rsp = self._send_auth(ap_req, "Kerberos", "AP_REQ")
+        targ = SPNEGO_NegTokenResp()
+        targ["NegState"] = b"\x00" # accept-completed
+        targ["SupportedMech"] = b""
+        targ["ResponseToken"] = rsp
+        self.proxy.step(targ.getData())
+
+
+class CredSSPTransport(Transport):
+    def __init__(self, url, creds):
+        super().__init__(url)
+        self.creds = creds
+        self._auth()
+
+    def _send(self, req):
+        sig, enc = self._wrap(req)
+        data, content_type = self._encrypted_request(sig, enc, len(req), "CredSSP")
+        rsp = self.session.post(self.url, data=data, headers={ "Content-Type" : content_type })
+        return self._decrypted_response(rsp, self._unwrap)
+
+    def _auth(self):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.options |= ssl.OP_NO_COMPRESSION | 0x00000200 | 0x00000800
+        self.tls_in  = ssl.MemoryBIO()
+        self.tls_out = ssl.MemoryBIO()
+        self.tls_obj = ctx.wrap_bio(self.tls_in, self.tls_out, server_side=False)
+
+        while True:
+            try:
+                self.tls_obj.do_handshake()
+            except:
+                pass
+            if req := self.tls_out.read():
+                rsp = self._send_auth(req, "CredSSP", "tls handshake")
+                self.tls_in.write(rsp)
+            else:
+                break
+
+        cert   = self.tls_obj.getpeercert(True)
+        pubkey = x509.load_der_x509_certificate(cert).public_key()
+        pubkey = pubkey.public_bytes(Encoding.DER, PublicFormat.PKCS1)
+        nonce  = randbytes(32)
+        pkhash = SHA256.new(b"CredSSP Client-To-Server Binding Hash\x00" + nonce + pubkey).digest()
+
+        def _send_credssp(req, phase=""):
+            sig, enc = self._wrap(encoder.encode(req))
+            if rsp := self._send_auth(sig + enc, "CredSSP", phase):
+                rsp = decoder.decode(self._unwrap(b"", rsp), asn1Spec=TSRequest())[0]
+                if rsp["errorCode"].hasValue():
+                    err = int.to_bytes(rsp["errorCode"]._value, length=4, signed=True).hex()
+                    raise TransportError(f"CredSSP: {phase} NT_ERROR=0x{err}")
+                return rsp
+
+        if isinstance(self.creds, NTCredential):
+            proxy = SPNEGOProxyNTLM(self.creds)
+        else:
+            proxy = SPNEGOProxyKerberos(self.creds)
+
+        t1 = proxy.step()
+        tsreq = TSRequest.nego_response(t1)
+        tsrsp = _send_credssp(tsreq, "SPNEGO init")
+        t3 = proxy.step(tsrsp["negoTokens"][0]["negoToken"].asOctets())
+
+        # TODO versions upto 5 need to send full public key instead of
+        # its hash but i can't find a windows version to test against:
+
+        tsreq = TSRequest.nego_response(t3)
+        tsreq["clientNonce"] = nonce
+        tsreq["pubKeyAuth"] = proxy.wrap(pkhash, joined=True)
+        tsrsp = _send_credssp(tsreq, "public key exchange")
+
+        # TODO: check if server bounced back correct pk hash
+
+        tspass = TSPasswordCreds()
+        tspass["domainName"] = self.creds.domain.encode("utf-16le")
+        tspass["userName"]   = self.creds.username.encode("utf-16le")
+        tspass["password"]   = self.creds.password.encode("utf-16le")
+
+        tscred = TSCredentials()
+        tscred["credType"] = 1
+        tscred["credentials"] = encoder.encode(tspass)
+
+        tsreq = TSRequest()
+        tsreq["version"]  = 6
+        tsreq["authInfo"] = proxy.wrap(encoder.encode(tscred), joined=True)
+
+        _send_credssp(tsreq, "credential delegation")
+
+    def _wrap(self, data):
+        self.tls_obj.write(data)
+        enc = self.tls_out.read()
+        cipher, proto, _ = self.tls_obj.cipher()
+        trailer_length = tls_trailer_length(len(enc), proto, cipher)
+        return enc[:trailer_length], enc[trailer_length:]
+
+    def _unwrap(self, sig, data):
+        self.tls_in.write(sig + data)
+        chunks = []
+        while True:
+            try:
+                chunks.append(self.tls_obj.read())
+            except ssl.SSLWantReadError:
+                break
+
+        return b"".join(chunks)
 
 # -- MS-PSRP stuff from https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-psrp ------
 class Runspace:
-    def __init__(self, transport, timeout=5):
-        self.transport      = transport
-        self.timeout        = timeout
-        self.object_buffer  = {}
-        self.next_object_id = 1
-        self.session_id     = str(uuid.uuid4()).upper()
-        self.shell_id       = str(uuid.uuid4()).upper()
-
-        self.current_command_id = None
+    def __init__(self, transport, timeout=1):
+        self.transport          = transport
+        self.timeout            = timeout
+        self.object_buffer      = {}
+        self.next_object_id     = 1
+        self.session_id         = str(uuid.uuid4()).upper()
+        self.shell_id           = str(uuid.uuid4()).upper()
+        self.command_id         = None
 
     def __enter__(self):
         messages = fragment(self.next_object_id, [
-            (SESSION_CAPABILITY, self.shell_id, zero_uuid, serialize(ps_session_capability)),
-            (INIT_RUNSPACEPOOL,  self.shell_id, zero_uuid, serialize(ps_runspace_pool))
+            (SESSION_CAPABILITY, self.shell_id, zero_uuid, ps_capability),
+            (INIT_RUNSPACEPOOL,  self.shell_id, zero_uuid, ps_runspace_pool)
         ])
 
         req = soap_req("create", self.session_id, timeout=self.timeout)
+        options = req.find("s:Header").find("wsman:OptionSet")
+        protocolversion = { "Name" : "protocolversion", "MustComply" : "true" }
+        ET.SubElement(options, "wsman:Option", protocolversion).text = "2.1"
 
-        req["s:Envelope"]["s:Header"]["wsman:OptionSet"]["wsman:Option"] = {
-            "@MustComply" : 'true',
-            "@Name"       : "protocolversion",
-            "#text"       : "2.3"
-        }
+        shell = ET.SubElement(req.find("s:Body"), "rsp:Shell", { "ShellId" : self.shell_id })
+        ET.SubElement(shell, "rsp:InputStreams").text = "stdin pr"
+        ET.SubElement(shell, "rsp:OutputStreams").text = "stdout"
+        ET.SubElement(shell, "creationXml").text = b64str(messages)
 
-        req["s:Envelope"]["s:Body"] = {
-            "rsp:Shell" : {
-                "@ShellId"          : self.shell_id,
-                "rsp:InputStreams"  : "stdin pr",
-                "rsp:OutputStreams" : "stdout",
-                "creationXml"       : b64str(messages)
-            }
-        }
-        # TODO: maybe deal with responses, but whatever.. doesn't seem to fail ever
-        # and if something happens it will error out when trying to create a pipeline
-        self._send(req)
+        self._post(req)
         self._receive()
         self._receive()
         return self
 
     def __exit__(self, exc_type, exc_value, tb):
         req = soap_req("delete", self.session_id, self.shell_id, self.timeout)
-        self._send(req)
+        self._post(req)
 
-    def run_command(self, cmd, debug=True):
-        command_id = self._create_pipeline(cmd)
-        if not command_id:
-            yield { "error" : "failed to create pipeline, if this persists just restart the shell" }
+    def run_command(self, cmd):
+        self.command_id = self._create_pipeline(cmd)
+        if not self.command_id:
+            yield { "error" : "failed to create pipeline, if this persists restart the shell" }
             return
 
         timeouts = 0
-        self.current_command_id = command_id
         while True:
-            rsp = self._receive(command_id)
+            rsp = self._receive(self.command_id)
             if "fault" in rsp:
                 if rsp["subcode"] == "w:TimedOut":
                     timeouts += 1                  # some commands take a while; this is fine, but
@@ -758,107 +924,116 @@ class Runspace:
                     yield { "error" : rsp["reason"] + "\n" + rsp["detail"] }
                     return
 
-            timeouts = 0 # reset timeout counter when we finally get a response
-            for msg_type, msg, _, _ in defragment(rsp["streams"], self.object_buffer):
+            timeouts = 0
+            for msg_type, msg, _, _ in defragment(rsp.get("streams"), self.object_buffer):
                 if msg_type == PIPELINE_OUTPUT: # from Write-Output
-                    yield { "stdout" : utfstr(msg.get("S") or "") }
+                    yield { "stdout" : xml_get_text(msg, ".", "") }
 
                 elif msg_type == ERROR_RECORD: # from Write-Error
-                    yield { "error" : utfstr(msg.get("Obj", {}).get("ToString") or "unknown error") }
+                    yield { "error" : xml_get_text(msg, ".//ToString", "unknown error") }
 
                 elif msg_type == WARNING_RECORD: # from Write-Warning
-                    yield { "warn" : utfstr(msg.get("Obj", {}).get("ToString") or "unknown warning") }
-
-                elif msg_type == INFORMATION_RECORD: # from Write-Host
-                    props = msg.get("Obj", {}).get("MS", {}).get("Obj", [{}])[0].get("Props", {})
-                    text = props.get("S", {}).get("#text") or ""
-                    endl = props.get("B", {}).get("#text", "false") == "false"
-                    yield { "info" : utfstr(text), "endl" : "\n" if endl else "" }
+                    yield { "warn" : xml_get_text(msg, ".//ToString", "unknown warning") }
 
                 elif msg_type == VERBOSE_RECORD: # from Write-Verbose
-                    yield { "verbose" : utfstr(msg.get("Obj", {}).get("ToString") or "") }
+                    yield { "verbose" : xml_get_text(msg, "ToString", "") }
 
-                elif msg_type == PIPELINE_STATE: # return exceptions as errors:
-                    err = msg.get("Obj", {}).get("MS", {}).get("Obj", {})
-                    if err.get("@N") == "ExceptionAsErrorRecord":
-                        yield { "error" : utfstr(err.get("ToString") or "uknonwn exception") }
+                elif msg_type == INFORMATION_RECORD: # from Write-Host
+                    info = xml_get_text(msg, ".//Props/S[@N='Message']", "")
+                    endl = xml_get_text(msg, ".//Props/B[@N='NoNewLine']", "false") == "false"
+                    yield { "info" : info, "endl" : "\n" if endl else "" }
+
+                elif msg_type == PIPELINE_STATE: # yield exceptions as errors:
+                    state = int(xml_get_text(msg, ".//I32[@N='PipelineState']"))
+                    if state in (3, 5, 6): # Stopped, Failed, Disconnected
+                        yield { "error" : xml_get_text(msg, ".//ToString", "") }
 
                 elif msg_type == PROGRESS_RECORD: # from Write-Progress
-                    for progress in msg.get("Obj", {}).get("MS", {}).get("S", []):
-                        yield { "progress" : progress.get("#text", "") }
-
-                else: # debug strays in case i missed something:
-                    logging.debug(f"{msg_ids.get(msg_type)} : {msg_type:x} : {msg}")
+                    status   = xml_get_text(msg, ".//S[@N='StatusDescription']", "status")
+                    activity = xml_get_text(msg, ".//S[@N='Activity']", "activity")
+                    yield { "progress" : status or activity }
 
             if rsp["state"]:
-                break # == CommandState/Done when pipeline finishes
+                if rsp["state"].endswith("CommandState/Done"):
+                    break
 
-        self.current_command_id = None
+        self.command_id = None
 
     def interrupt(self):
-        if not self.current_command_id:
-            return
-        req = soap_req("signal", self.session_id, self.shell_id, self.timeout)
-        req["s:Envelope"]["s:Body"] = {
-            "rsp:Signal" : {
-                "@CommandId" : self.current_command_id,
-                "rsp:Code" : "powershell/signal/crtl_c",
-            }
-        }
-        return self._send(req)
+        if self.command_id:
+            req = soap_req("signal", self.session_id, self.shell_id, self.timeout)
+            body = req.find("s:Body")
+            sig = ET.SubElement(body, "rsp:Signal", { "CommandId" : self.command_id })
+            ET.SubElement(sig, "rsp:Code").text = "powershell/signal/crtl_c"
+            return self._post(req)
 
-    def _send(self, req):
-        rsp = self.transport.send(serialize(req))
-        return soap_rsp(deserialize(rsp))
+    def _post(self, req):
+        rsp = ET.fromstring(self.transport.send(ET.tostring(req, encoding="utf8")))
+        action = rsp.find("./s:Header/a:Action", soap_ns).text
+        if action.endswith("wsman/fault"):
+            return {
+                "fault"   : "ok",
+                "subcode" : xml_get_text(rsp, ".//s:Subcode/s:Value", ""),
+                "reason"  : xml_get_text(rsp, ".//s:Reason/s:Text", ""),
+                "detail"  : xml_get_text(rsp, ".//s:Detail/s:Message", "")
+            }
+        elif action.endswith("shell/ReceiveResponse"):
+            return {
+                "receive" : "ok",
+                "streams" : [ b64decode(s.text) for s in rsp.findall(".//rsp:Stream", soap_ns) ],
+                "state"   : xml_get_attrib(rsp, ".//rsp:CommandState", "State", "")
+            }
+        elif action.endswith("transfer/CreateResponse"):
+            return { "create" : "ok" }
+        elif action.endswith("shell/CommandResponse"):
+            return { "command" : "ok" }
+        elif action.endswith("shell/SignalResponse"):
+            return { "signal" : "ok" }
+        elif action.endswith("transfer/DeleteResponse"):
+            return { "delete" : "ok" }
+        else:
+            raise NotImplementedError(action)
 
     def _receive(self, command_id=None):
         req = soap_req("receive", self.session_id, self.shell_id, self.timeout)
+        receive = ET.SubElement(req.find("s:Body"), "rsp:Receive")
+        if command_id:
+            ET.SubElement(receive, "rsp:DesiredStream", { "CommandId" : command_id }).text = "stdout"
+        else:
+            ET.SubElement(receive, "rsp:DesiredStream").text = "stdout"
 
-        req["s:Envelope"]["s:Header"]["wsman:OptionSet"]["wsman:Option"] = {
-            "@Name" : "WSMAN_CMDSHELL_OPTION_KEEPALIVE", "#text" : "True"
-        }
-        stream = { "#text" : "stdout" } | ({ "@CommandId" : command_id} if command_id else {})
+        return self._post(req)
 
-        req["s:Envelope"]["s:Body"] = { "rsp:Receive" : { "rsp:DesiredStream" : stream } }
-
-        return self._send(req)
-
-    def _create_pipeline(self, cmd):
+    def _create_pipeline(self, cmd, host_ui=False):
         command_id = str(uuid.uuid4()).upper()
 
-        # Invoke-Expression $cmd | Out-String -Stream
         create_pipeline = ps_create_pipeline([
-            ("Invoke-Expression", { "Command" : cmd }),
-            ("Out-String", { "Stream" : None } )
+            ps_command("Invoke-Expression", { "Command" : cmd }),
+            ps_command("Out-String", { "Stream" : None })
         ])
-
         messages = fragment(self.next_object_id, [
-            (CREATE_PIPELINE, self.shell_id, command_id, serialize(create_pipeline))
+            (CREATE_PIPELINE, self.shell_id, command_id, create_pipeline)
         ])
 
         req = soap_req("command", self.session_id, self.shell_id, self.timeout)
-        req["s:Envelope"]["s:Body"] = {
-            "rsp:CommandLine" : {
-                "@CommandId" : command_id,
-                "rsp:Command" : "",
-                "rsp:Arguments" : b64str(messages)
-            }
-        }
-        rsp = self._send(req)
-
+        cmdline = ET.SubElement(req.find("s:Body"), "rsp:CommandLine", { "CommandId" : command_id })
+        ET.SubElement(cmdline, "rsp:Command")
+        ET.SubElement(cmdline, "rsp:Arguments").text = b64str(messages)
+        rsp = self._post(req)
         if "command" in rsp:
             return command_id
 
-# so with Runspace class you can execute commands like this, eg:
-# transport = NTLMTransport("http://box.htb:5985/wsman", "username", "password")
-# with Runspace(transport) as runspace:
-#  for output in runspace.run_command("whoami /all"):
-#     print(output)
-
-
+# -------------------------------------------------------------------------------------------------
+# so with Runspace class you can execute commands like this:
+# >>> creds = NTCredential("domain", "username", "password")
+# >>> transport = SPNEGOTransport("http://dc01.test.lab:5985/wsman", creds)
+# >>> with Runspace(transport) as runspace:
+# >>>     for output in runspace.run_command("whoami /all"):
+# >>>         print(output)
 
 # the rest of the code here parses impacket-style arguments (in main) and implements a
 # simple shell that runs a REPL loop:
+
 from signal import SIGINT, signal, getsignal
 from argparse import ArgumentParser
 from ipaddress import ip_address
@@ -909,6 +1084,7 @@ class CtrlCHandler:
         self.released = True
         return True
 
+
 class Shell:
     def __init__(self, runspace):
         self.runspace  = runspace
@@ -918,9 +1094,9 @@ class Shell:
         if prompt_toolkit_available:
             self.prompt_history = FileHistory(".winrmexec_history")
 
-    def repl(self, inputs=None, debug=True):
+    def repl(self, inputs=None):
         if not inputs:
-            inputs = self.read_line()
+            inputs = self.read_cmd_prompt()
             self.update_cwd()
 
         for cmd in inputs:
@@ -932,7 +1108,7 @@ class Shell:
                 self.run_with_interrupt(cmd, self.write_line)
                 self.update_cwd()
 
-    def read_line(self):
+    def read_cmd_prompt(self):
         while True:
             try:
                 pre = f"\x1b[1m\x1b[33mPS\x1b[0m {self.cwd}> "
@@ -951,25 +1127,23 @@ class Shell:
         clear = "\033[2K\r" if self.need_clear else ""
         self.need_clear = False
 
-        log_msg = b""
-        if msg := out.get("stdout"): # from Write-Output
-            print(clear + msg, flush=True)
+        if "stdout" in out: # from Write-Output
+            print(clear + out["stdout"], flush=True)
 
-        elif msg := out.get("info"): # from Write-Host
-            endl = out.get("endl", "\n")
-            print(clear + msg, end=endl, flush=True)
+        elif "info" in out: # from Write-Host
+            print(clear + out["info"], end=out.get("endl"), flush=True)
 
-        elif msg := out.get("error"): # from Write-Error and exceptions
-            print(clear + "\x1b[31m" + msg + "\x1b[0m", flush=True)
+        elif "error" in out: # from Write-Error and exceptions
+            print(clear + "\x1b[31m" + out["error"] + "\x1b[0m", flush=True)
 
-        elif msg := out.get("warn"): # from Write-Warning
-            print(clear + "\x1b[33m" + msg + "\x1b[0m", flush=True)
+        elif "warn" in out: # from Write-Warning
+            print(clear + "\x1b[33m" + out["warn"] + "\x1b[0m", flush=True)
 
-        elif msg := out.get("verbose"): # from Write-Verbose
-            print(clear + msg, flush=True)
+        elif "verbose" in out: # from Write-Verbose
+            print(clear + out["verbose"], flush=True)
 
-        elif progress := out.get("progress"): # from Write-Progress
-            print(clear + "\x1b[34m" + progress + "\x1b[0m", end="\r", flush=True)
+        elif "progress" in out: # from Write-Progress
+            print(clear + "\x1b[34m" + out["progress"] + "\x1b[0m", end="\r", flush=True)
             self.need_clear = True
 
     def update_cwd(self):
@@ -1001,143 +1175,49 @@ class Shell:
         return h.interrupted > 0
 
 
-def main():
-    """
-# NTLM Examples:
-  $ winrmexec.py 'box.htb/username:password@dc.box.htb'
-  $ winrmexec.py 'username:password@dc.box.htb'
-  $ winrmexec.py -hashes 'LM:NT' 'username@dc.box.htb'
-  $ winrmexec.py -hashes ':NT' 'username@dc.box.htb'
+def get_krb_creds(dc_ip, spn, domain, username, password="", nt_hash="", aes_key="", use_ccache=True):
+    user = Principal(username, type=PrincipalNameType.NT_PRINCIPAL.value)
+    http = Principal(spn,      type=PrincipalNameType.NT_PRINCIPAL.value)
+    ticket = Ticket()
 
-If password/hashes are not specified, it will prompt for password:
-  $ winrmexec.py username@dc.box.htb
-
-If '-target-ip' is specified, target will be ignored (still needs '@' after user[:pass])
-  $ winrmexec.py -target-ip '10.10.11.xx' 'username:password@whatever'
-  $ winrmexec.py -target-ip '10.10.11.xx' 'username:password@'
-
-If '-target-ip' is not specified, then target-ip=target
-
-If '-ssl' is specified, it will use 5986 port and https:
-  $ winrmexec.py -ssl 'username:password@dc01.box.htb'
-
-If '-port' is specified, it will use that instead of 5985. If 'ssl' is also specified it will use https:
-  $ winrmexec.py -ssl -port 8443 'username:password@dc01.box.htb'
-
-If '-url' is specified, target, target-ip and port will be ignored:
-  $ winrmexec.py -url 'http://dc.box.htb:8888/endpoint' 'username:password@whatever'
-
-If '-url' is not specified it will be constructed as http(s)://target_ip:port/wsman
-
-# Kerberos Examples:
-  $ winrmexec.py -k 'box.htb/username:password@dc.box.htb'
-  $ winrmexec.py -k -hashes 'LM:NT' 'box.htb/username@dc.box.htb'
-  $ winrmexec.py -k -aesKey 'AESHEX' 'box.htb/username@dc.box.htb'
-
-If KRB5CCACHE is in env, it will use domain and username from there:
-  $ KRB5CCNAME=ticket.ccache winrmexec.py -k -no-pass 'dc.box.htb'
-
-It doesn't hurt if you also specify domain/username, but they will be ignored:
-  $ KRB5CCNAME=ticket.ccache winrmexec.py -k -no-pass 'box.htb/username@dc.box.htb'
-
-If target does not resolve to ip, you have to specify target-ip:
-  $ winrmexec.py -k -no-pass -target-ip '10.10.11.xx' 'box.htb/username:password@DC'
-  $ KRB5CCNAME=ticket.ccache winrmexec.py -k -no-pass -target-ip '10.10.11.xx' DC
-
-For Kerbros auth it is important that target is a host or FQDN, as it will be used
-to construct SPN as HTTP/{target}@{domain}.
-
-Or you can specify '-spn' yourself, in which case target will be ignored (or used only as target-ip):
-  $ winrmexec.py -k -spn 'http/dc' 'box.htb/username:password@dc.box.htb'
-  $ winrmexec.py -k -target-ip '10.10.11.xx' -spn 'http/dc' box.htb/username:password@whatever
-  $ KRB5CCNAME=ticket.ccache winrmexec.py -k -no-pass -target-ip '10.10.11.xx' -spn 'http/dc' 'whatever'
-
-If you have a TGS for SPN other than HTTP (for example CIFS) it still works (at least from what i tried)
-If you have a TGT, then it will request TGS for HTTP/{target}@{domain} (or whatever was in your '-spn')
-
-If '-dc-ip' is not specified then dc-ip=domain
-For '-url' / '-port' / '-ssl' same rules apply as for NTLM
-
-# Basic Auth Examples (not likely to be enabled):
-Same as for NTLM except hashes are not supported:
-  # winrmexec.py -basic username:password@dc.box.htb
-  # winrmexec.py -basic -target-ip '10.10.11.xx' 'username:password@whatever'
-  # winrmexec.py -basic -target-ip '10.10.11.xx' -ssl 'username:password@whatever'
-  # winrmexec.py -basic -url 'http://10.10.11.xx/endpoint' 'username:password@whatever'
-"""
-
-    print(version.BANNER)
-    parser = ArgumentParser()
-
-    parser.add_argument("target", help="[[domain/]username[:password]@]<target>")
-    parser.add_argument('-ts', action='store_true', help='adds timestamp to every logging output')
-    parser.add_argument('-debug', action='store_true', help='Turn DEBUG output ON')
-    parser.add_argument('-examples', action='store_true', help='Show examples')
-
-    # -- connection params: -----------------------------------------------------------------------
-    group = parser.add_argument_group('connection')
-    group.add_argument("-dc-ip", default="",
-        help="IP Address of the domain controller. If omitted it will use the "\
-             "domain part (FQDN) specified in the target parameter")
-
-    group.add_argument("-target-ip", default="",
-        help="IP Address of the target machine. If ommited it will use whatever "\
-              "was specified as target. This is useful when target is the NetBIOS"\
-              "name and you cannot resolve it")
-
-    group.add_argument("-port", default="",
-        help="Destination port to connect to WinRM http server, default is 5985")
-
-    group.add_argument("-ssl", action="store_true", help="Use HTTPS")
-
-    group.add_argument("-basic", action="store_true", help="Use Basic auth")
-
-    group.add_argument("-url", default="",
-        help="Exact WSMan endpoint, eg. http://host:port/custom_wsman. "\
-             "Otherwise it will be constructed as http(s)://target_ip:port/wsman")
-
-    # -- authentication params: -------------------------------------------------------------------
-    group = parser.add_argument_group('authentication')
-    group.add_argument("-spn", default="", help="Specify exactly the SPN to request for TGS")
-
-    group.add_argument("-hashes", default="", metavar="LMHASH:NTHASH",
-        help="NTLM hashes, format is LMHASH:NTHASH")
-
-    group.add_argument("-no-pass", action="store_true", help="don't ask for password (useful for -k)")
-
-    group.add_argument("-k", action="store_true",
-        help="Use Kerberos authentication. Grabs credentials from ccache file (KRB5CCNAME)"\
-             "based on target parameters. If valid credentials cannot be found, it will "\
-             "use the ones specified in the command line")
-
-    group.add_argument('-aesKey', metavar = "HEXKEY", default="",
-        help="AES key to use for Kerberos Authentication")
-
-    # -- shell params: ----------------------------------------------------------------------------
-    parser.add_argument("-X", default="", metavar="COMMAND",
-        help="Command to execute, if ommited it will spawn a janky interactive shell")
-
-    parser.add_argument("-timeout", default="5", metavar="SEC", help="Timeout for requests to /wsman")
-
-
-    args = parser.parse_args()
-
-    if args.examples:
-        print(main.__doc__)
-        exit()
-
-    logger.init(args.ts)
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.debug(version.getInstallationPath())
+    if use_ccache and os.getenv("KRB5CCNAME"):
+        _, _, tgt, tgs = CCache.parseFile(target=spn)
+        if tgt and not tgs:
+            cipher = tgt["cipher"]
+            tgtkey = tgt["sessionKey"]
+            tgt    = tgt["KDC_REP"]
+        elif tgs:
+            ticket.from_asn1(decoder.decode(tgs["KDC_REP"], asn1Spec=TGS_REP())[0]["ticket"])
+            tgskey = tgs["sessionKey"]
+            return KrbCredential(domain, username, ticket, tgskey, password)
     else:
-        logging.getLogger().setLevel(logging.INFO)
+        logging.info(f"requesting TGT for {domain}\\{username}")
+        tgt, cipher, _, tgtkey = getKerberosTGT(user, password, domain, "", nt_hash, aes_key, dc_ip)
 
+    if not tgt:
+        raise RuntimeError("Kerberos: could not get TGT or TGS")
+
+    logging.info(f"requesting TGS for {spn}")
+    tgs, cipher, _, tgskey = getKerberosTGS(http, domain, dc_ip, tgt, cipher, tgtkey)
+    ticket.from_asn1(decoder.decode(tgs, asn1Spec=TGS_REP())[0]["ticket"])
+    return KrbCredential(domain, username, ticket, tgskey, password)
+
+
+# creates a transport class for winrm from common impacket-style arguments:
+def create_transport(args):
     domain, username, password, targetName = parse_target(args.target)
 
+    if args.cert_pem or args.cert_key:
+        logging.info("'-cert-pem' specified, using ssl")
+        args.ssl = True # client certificate implies ssl
+
     if args.aesKey and not args.k:
-        logging.info("'-aesKey' key specified, using kerberos")
-        args.k = True
+        logging.info("'-aesKey' specified, using kerberos")
+        args.k = True # aesKey imples kerberos
+
+    if sum((args.k, args.basic, bool(args.cert_pem or args.cert_key))) > 1:
+        logging.fatal("'-k', '-basic', and '-cert-*' are mutually excluseive, pick one or none")
+        exit()
 
     aes_key = args.aesKey
     nt_hash = args.hashes.split(':')[1] if ':' in args.hashes else ""
@@ -1169,20 +1249,54 @@ Same as for NTLM except hashes are not supported:
     else:
         url = args.url
 
-    if args.k:
+    if args.basic:
+        if not username or not password:
+            logging.fatal(f"Need username and password for basic auth")
+            exit()
+        return BasicTransport(url, username, password)
+
+    elif args.cert_pem or args.cert_key:
+        if not args.cert_pem:
+            logging.fatal("Missing client certificate (-cert-pem)")
+            exit()
+        if not Path(args.cert_pem).is_file():
+            logging.fatal(f"Could not find client certificate file {args.cert_pem}")
+            exit()
+        if not args.cert_key:
+            logging.fatal("Missing client certificate private key (-cert-key)")
+            exit()
+        if not Path(args.cert_key).is_file():
+            logging.fatal(f"Could not find client certificate key file {args.cert_key}")
+            exit()
+        if not urlparse(url).scheme == "https":
+            logging.fatal("Authentication with client certificate works only over https")
+            exit()
+        return ClientCertTransport(url, args.cert_pem, args.cert_key)
+
+    nt_creds = None
+    krb_creds = None
+
+    if not args.k:
+        nt_creds = NTCredential(domain, username, password, nt_hash)
+    else:
         if os.getenv("KRB5CCNAME"): # use domain/username from ccache
             domain, username, _, _ = CCache.parseFile()
             logging.info(f"using domain and username from ccache: {domain}\\{username}")
+
         elif not domain or not username or not has_creds:
             logging.fatal("Need domain, username and one of password/nthash/aes for kerberos auth")
             exit()
+
         if not args.spn:
             try:
                 ip_address(targetName)
-                logging.error(f"when using kerberos and '-spn' is not specified, 'targetName' must be FQDN")
+                logging.error(f"when '-spn' is not specified 'targetName' can not be IP")
                 exit()
             except ValueError:
-                pass
+                spn = f"HTTP/{targetName}@{domain}"
+                logging.info(f"'-spn' not specified, using {spn}")
+        else:
+            spn = args.spn
 
         if not args.dc_ip:
             logging.info(f"'-dc-ip' not specified, using {domain}")
@@ -1190,29 +1304,102 @@ Same as for NTLM except hashes are not supported:
         else:
             dc_ip = args.dc_ip
 
-        if not args.spn:
-            spn = args.spn or f"HTTP/{targetName}@{domain}"
-            logging.info(f"'-spn' not specified, using {spn}")
-        else:
-            spn = args.spn
+        krb_creds = get_krb_creds(dc_ip, spn, domain, username, password, nt_hash, aes_key)
 
-        transport = KerberosTransport(url, dc_ip, spn, domain, username, password, nt_hash, aes_key)
-
-    elif args.basic:
-        if not username or not password:
-            logging.fatal(f"Need username and password for basic auth")
+    if args.credssp:
+        creds = nt_creds or krb_creds
+        if not creds.username or not creds.password:
+            logging.error("CredSSP needs username and password, even for kerberos")
             exit()
-        transport = BasicTransport(url, username, password)
+        return CredSSPTransport(url, creds)
 
+    elif args.k:
+        try:
+            return KerberosTransport(url, krb_creds)
+        except TransportError:
+            logging.info("Kerberos via GSS failed, trying SPNEGO")
+            return SPNEGOTransport(url, krb_creds)
     else:
-        if not username or not (password or nt_hash):
-            logging.fatal(f"Need username and password or hashes for ntlm auth")
-            exit()
-        transport = NTLMTransport(url, username, password, nt_hash)
+        return SPNEGOTransport(url, nt_creds)
 
-    timeout = int(args.timeout)
 
-    with Runspace(transport, timeout) as runspace:
+def argument_parser():
+    parser = ArgumentParser()
+
+    parser.add_argument("target", help="[[domain/]username[:password]@]<target>")
+    parser.add_argument('-ts', action='store_true', help='adds timestamp to every logging output')
+    parser.add_argument('-debug', action='store_true', help='Turn DEBUG output ON')
+
+    # -- connection params: -----------------------------------------------------------------------
+    group = parser.add_argument_group('connection')
+    group.add_argument("-dc-ip", default="",
+        help="IP Address of the domain controller. If omitted it will use the "\
+             "domain part (FQDN) specified in the target parameter")
+
+    group.add_argument("-target-ip", default="",
+        help="IP Address of the target machine. If ommited it will use whatever "\
+              "was specified as target. This is useful when target is the NetBIOS"\
+              "name and you cannot resolve it")
+
+    group.add_argument("-port", default="",
+        help="Destination port to connect to WinRM http server, default is 5985")
+
+    group.add_argument("-ssl", action="store_true", help="Use HTTPS")
+
+    group.add_argument("-url", default="",
+        help="Exact WSMan endpoint, eg. http://host:port/custom_wsman. "\
+             "Otherwise it will be constructed as http(s)://target_ip:port/wsman")
+
+    # -- authentication params: -------------------------------------------------------------------
+    group = parser.add_argument_group('authentication')
+    group.add_argument("-spn", default="", help="Specify exactly the SPN to request for TGS")
+
+    group.add_argument("-hashes", default="", metavar="LMHASH:NTHASH",
+        help="NTLM hashes, format is LMHASH:NTHASH")
+
+    group.add_argument("-no-pass", action="store_true", help="don't ask for password (useful for -k)")
+
+    group.add_argument("-k", action="store_true",
+        help="Use Kerberos authentication. Grabs credentials from ccache file (KRB5CCNAME)"\
+             "based on target parameters. If valid credentials cannot be found, it will "\
+             "use the ones specified in the command line")
+
+    group.add_argument('-aesKey', metavar = "HEXKEY", default="",
+        help="AES key to use for Kerberos Authentication")
+
+    group.add_argument("-basic", action="store_true", help="Use Basic auth")
+
+    group.add_argument("-cert-pem", default="", help="Client certificate")
+
+    group.add_argument("-cert-key", default="", help="Client certificate private key")
+
+    group.add_argument("-credssp", action="store_true",
+        help="Use CredSSP if enabled, works with NTLM and Kerberos but it needs "\
+             "plaintext password either way")
+
+    # -- shell params: ----------------------------------------------------------------------------
+    parser.add_argument("-X", default="", metavar="COMMAND",
+        help="Command to execute, if ommited it will spawn a janky interactive shell")
+
+    parser.add_argument("-timeout", default="1", metavar="SEC", help="Timeout for requests to /wsman")
+
+    return parser
+
+
+def main():
+    print(version.BANNER)
+    args = argument_parser().parse_args()
+
+    logger.init(args.ts)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.debug(version.getInstallationPath())
+    else:
+        logging.getLogger().setLevel(logging.INFO)
+
+    transport = create_transport(args)
+
+    with Runspace(transport, int(args.timeout)) as runspace:
         shell = Shell(runspace)
         try:
             if args.X:
