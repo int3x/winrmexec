@@ -83,9 +83,17 @@ winrmexec.py -cert-pem 'user.pem' -cert-key 'user.key' 'dc01.box.htb'
 ```
 
 ### CredSSP:
-To authenticate using CredSSP using either NTLM or Kerberos auth. Either way you will need
-a password because it's a thing that CredSSP (google CredSSP double-hop):
-
+Authenticate using CredSSP:
+```bash
+$ winrmexec.py 'box.htb/username:password@dc.box.htb' -credssp
+$ winrmexec.py 'username:password@dc.box.htb' -credssp
+```
+If `-k` is specified it will use Kerberos during SPNEGO phase, but here plaintext credentials
+are needed anyway. Using `KRB5CCNAME` is not really usefull here unless you can't connect to
+kerberos service on `:88` port and somehow got TGS anyway:
+```bash
+$ winrmexec.py 'box.htb/username:password@dc.box.htb' -k -credssp
+```
 
 # Setup WinRM for testing
 
