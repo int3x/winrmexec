@@ -585,11 +585,11 @@ class SPNEGOProxyKerberos:
             raise NotImplementedError("request-mic")
 
     def wrap(self, req, joined=False):
-        sig = bytearray(pack(">BBBBHHQ", 5, 4, 6, 0xff, 0, 0, self.seq_cli))
+        sig = pack(">BBBBHHQ", 5, 4, 6, 0xff, 0, 0, self.seq_cli)
         enc = self.cipher.encrypt(self.subkey, KG_USAGE_INITIATOR_SEAL, req + sig, None)
         rot = len(enc) - (28 % len(enc))
         enc = enc[rot:] + enc[:rot]
-        sig[7] = 28 # too lazy to make that WrapToken structure just to set one value
+        sig = pack(">BBBBHHQ", 5, 4, 6, 0xff, 0, 28, self.seq_cli)
         self.seq_cli += 1
         return sig + enc if joined else (sig + enc[:44], enc[44:])
 
@@ -1217,6 +1217,10 @@ def create_transport(args):
 
     if sum((args.k, args.basic, bool(args.cert_pem or args.cert_key))) > 1:
         logging.fatal("'-k', '-basic', and '-cert-*' are mutually excluseive, pick one or none")
+        exit()
+
+    if args.credssp and (args.basic or args.cert_pem or args.cert_key):
+        logging.fatal("'-credssp' does not work with '-basic' or '-cert-*'")
         exit()
 
     aes_key = args.aesKey
