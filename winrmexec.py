@@ -1,4 +1,4 @@
-import os, sys, re, uuid, logging, time, ssl
+import os, sys, re, uuid, logging, ssl, shlex
 
 from base64 import b64encode, b64decode
 from struct import pack, unpack
@@ -9,7 +9,7 @@ from datetime import datetime, UTC
 import xml.etree.ElementTree as ET
 
 # pip install requests
-from requests import Session
+from requests import Session, Request
 
 from urllib3 import disable_warnings
 from urllib3.util import SKIP_HEADER
@@ -54,6 +54,10 @@ from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 # -- helpers and constants: -----------------------------------------------------------------------
+def chunks(xs, n):
+    for off in range(0, len(xs), n):
+        yield xs[off:off+n]
+
 def b64str(s):
     if isinstance(s, str):
         return b64encode(s.encode()).decode()
@@ -70,6 +74,23 @@ def utfstr(s):
         return _utfstr.sub(lambda m: bytes.fromhex(m.group(1)).decode("utf-16be"), s)
     except:
         return s
+
+def split_args(cmdline):
+    try:
+        args = shlex.split(cmdline, posix=False)
+    except ValueError:
+        return []
+
+    fixed = []
+    for arg in args:
+        if arg.startswith('"') and arg.endswith('"'):
+            fixed.append(arg[1:-1])
+        elif arg.startswith("'") and arg.endswith("'"):
+            fixed.append(arg[1:-1])
+        else:
+            fixed.append(arg)
+    return fixed
+
 
 zero_uuid = str(uuid.UUID(bytes_le=bytes(16))).upper()
 
@@ -163,12 +184,13 @@ soap_actions = {
     "delete"  : "http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete",
     "receive" : "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive",
     "command" : "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command",
-    "signal"  : "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal"
+    "signal"  : "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal",
 }
 
+#https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wsmv/1c651dae-1f95-40b0-8d8d-ccd2793640e3
 soap_ns = {
     "s"     : "http://www.w3.org/2003/05/soap-envelope",
-    "a"     : "http://schemas.xmlsoap.org/ws/2004/08/addressing",
+    "wsa"   : "http://schemas.xmlsoap.org/ws/2004/08/addressing",
     "rsp"   : "http://schemas.microsoft.com/wbem/wsman/1/windows/shell",
     "wsman" : "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd",
     "wsmv"  : "http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd",
@@ -191,7 +213,7 @@ def xml_get_attrib(root, xpath, attrib, default=None):
         return el.get(attrib) or default
 
 # fill in common fields for soap request:
-def soap_req(action, session_id, shell_id=None, timeout=1):
+def soap_req(action, session_id, shell_id=None, timeout=1, plugin="Microsoft.PowerShell"):
     message_id = str(uuid.uuid4()).upper()
     must_undestand = lambda v=True: { "s:mustUnderstand" : str(v).lower() }
 
@@ -200,17 +222,19 @@ def soap_req(action, session_id, shell_id=None, timeout=1):
     body     = ET.SubElement(envelope, "s:Body")
 
     ET.SubElement(header, "wsman:ResourceURI", must_undestand()).text \
-        = "http://schemas.microsoft.com/powershell/Microsoft.PowerShell"
+        = f"http://schemas.microsoft.com/powershell/{plugin}"
 
-    ET.SubElement(ET.SubElement(header, "a:ReplyTo"), "a:Address", must_undestand()).text \
+    ET.SubElement(ET.SubElement(header, "wsa:ReplyTo"), "wsa:Address", must_undestand()).text \
         = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
 
-    ET.SubElement(header, "a:To").text = "http://localhost"
-    ET.SubElement(header, "a:Action", must_undestand()).text = soap_actions[action]
-    ET.SubElement(header, "a:MessageID").text = f"uuid:{message_id}"
-    ET.SubElement(header, "wsman:MaxEnvelopeSize", must_undestand()).text = "64000"
+    ET.SubElement(header, "wsa:To").text = "http://localhost/wsman"
+    ET.SubElement(header, "wsa:Action", must_undestand()).text = soap_actions[action]
+    ET.SubElement(header, "wsa:MessageID").text = f"uuid:{message_id}"
+    ET.SubElement(header, "wsman:MaxEnvelopeSize", must_undestand()).text = "153600"
+    ET.SubElement(header, "wsman:Locale", must_undestand(False) | { "xml:lang" : "en-US" })
     ET.SubElement(header, "wsman:OperationTimeout").text = f"PT{timeout}S"
     ET.SubElement(header, "wsman:OptionSet", must_undestand())
+    ET.SubElement(header, "wsmv:DataLocale", must_undestand(False) | { "xml:lang" : "en-US" })
     ET.SubElement(header, "wsmv:SessionId", must_undestand(False)).text = f"uuid:{session_id}"
 
     selector = ET.SubElement(header, "wsman:SelectorSet")
@@ -262,10 +286,10 @@ ps_runspace_pool = ps_struct(None, [
     ps_simple("ApplicationArguments", "Nil", None)
 ])
 
-ps_args = lambda args: [
+ps_args = lambda args, raw=False: [
     ps_struct(None, [
         ps_simple("N", "S", k),
-        ps_simple("V", "S" if v else "Nil", v)
+        ps_simple("V", "S" if v else "Nil", v) if not raw else v
     ]) for k, v in args.items()
 ]
 
@@ -306,6 +330,7 @@ ps_create_pipeline = lambda commands : ps_struct(None, [
     ])
 ])
 
+
 # -- message framing: -----------------------------------------------------------------------------
 msg_ids = {
     0x00010002 : "SESSION_CAPABILITY",
@@ -343,65 +368,6 @@ msg_ids = {
 
 for k, v in msg_ids.items():
     globals()[v] = k
-
-def fragment(next_obj_id, messages):
-    # this doesn't do proper fragmentation over multiple Send requests, but my
-    # thinking here is that i'm *sending* only smallish messages, so i can get away
-    # with it; defragment() does it properly because server responses can get very large:
-    fragments = b""
-
-    for msg_type, rpid, pid, data in messages:
-        this  = pack("<I", 0x00002)          # destination = SERVER
-        this += pack("<I", msg_type)
-        this += uuid.UUID(rpid).bytes_le
-        this += uuid.UUID(pid).bytes_le
-        this += ET.tostring(data)
-
-        fragments += pack(">Q", next_obj_id) # object_id
-        fragments += pack(">Q", 0)           # fragment_id
-        fragments += pack(">B", 0x1 | 0x2)
-        fragments += pack(">I", len(this))
-        fragments += this
-
-        next_obj_id += 1
-
-    return fragments
-
-def defragment(streams, object_buffer):
-    for buf in streams:
-        fragments = []
-        while buf:
-            object_id, fragment_seq = unpack(">QQ", buf[:16])
-            is_start, is_end = bool(buf[16] & 1), bool(buf[16] & 2)
-            msg_len, = unpack(">I", buf[17:21])
-            partial = buf[21:21 + msg_len]
-            buf = buf[21 + msg_len:]
-
-            this = object_buffer.get(object_id)
-            if this is None:
-                this = { "seq" : fragment_seq, "data" : b"" }
-                object_buffer[object_id] = this
-
-            if is_start and is_end:
-                fragments.append(partial)
-                del object_buffer[object_id]
-            elif is_start:
-                this["data"] = partial
-                this["seq"] += 1
-            elif is_end:
-                fragments.append(this["data"] + partial)
-                del object_buffer[object_id]
-            else:
-                this["data"] += partial
-                this["seq"]  += 1
-
-        for frag in fragments:
-            _, msg_type = unpack("<II", frag[:8])
-            rpid = str(uuid.UUID(bytes_le=frag[8:24])).upper()
-            pid  = str(uuid.UUID(bytes_le=frag[24:40])).upper()
-            msg  = ET.fromstring(frag[40:])
-            yield (msg_type, msg, rpid, pid)
-
 
 # -- transports: ----------------------------------------------------------------------------------
 class TransportError(Exception):
@@ -444,7 +410,7 @@ class SPNEGOProxyNTLM:
             targ = SPNEGO_NegTokenResp(data_in)
             neg_state = targ["NegState"][0]
         except:
-            raise TransportError("SPNEGO: bad response")
+            raise SPNEGOError("SPNEGO: bad response")
 
         if neg_state == 0: # accept-completed
             self.complete = True
@@ -470,7 +436,8 @@ class SPNEGOProxyNTLM:
             resp["SupportedMech"] = b""
             resp["ResponseToken"] = type3.getData()
 
-            self.msgseq  = 0
+            self.seq_cli  = 0
+            self.seq_srv  = 0
             self.key_cli = SIGNKEY(type3["flags"], key, "Client")
             self.key_srv = SIGNKEY(type3["flags"], key, "Server")
             self.rc4_cli = ARC4.new(SEALKEY(type3["flags"], key, "Client"))
@@ -484,20 +451,21 @@ class SPNEGOProxyNTLM:
             raise NotImplementedError("request-mic")
 
     def wrap(self, req, joined=False):
-        seq = pack("<I", self.msgseq)
+        seq = pack("<I", self.seq_cli)
         enc = self.rc4_cli.encrypt(req)
         sig = HMAC.new(self.key_cli, seq + req, digestmod=MD5).digest()[:8]
         sig = pack("<I", 1) + self.rc4_cli.encrypt(sig) + seq
-        self.msgseq += 1
+        self.seq_cli += 1
         return (sig + enc) if joined else (sig, enc)
 
     def unwrap(self, sig, enc):
         plaintext = self.rc4_srv.decrypt(enc)
-        seq = pack("<I", self.msgseq - 1)
+        seq = pack("<I", self.seq_srv)
         sig_test = HMAC.new(self.key_srv, seq + plaintext, digestmod=MD5).digest()[:8]
         sig_test = self.rc4_srv.decrypt(sig_test)
         if sig[4:12] != sig_test:
             raise SPNEGOError("unwrap(): message integrity failure")
+        self.seq_srv += 1
         return plaintext
 
 
@@ -639,31 +607,37 @@ class Transport:
 
         return b64decode(www_auth.removeprefix(f"{proto} "))
 
-    def _encrypted_request(self, sig, enc, orig_len, proto):
-        prefix   = b"Content-Type: application/octet-stream\r\n"
-        suffix   = b"--Encrypted Boundary--\r\n"
-        protocol = f"application/HTTP-{proto}-session-encrypted"
+    def _encrypted_request(self, req, proto, wrap_fn):
+        protocol  = f"application/HTTP-{proto}-session-encrypted"
 
-        data  = b"--Encrypted Boundary\r\n"
-        data += f"Content-Type: {protocol}\r\n".encode()
-        data += f"OriginalContent: type=application/soap+xml;charset=UTF-8;Length={orig_len}\r\n".encode()
-        data += b"--Encrypted Boundary\r\n"
-        data += prefix + pack("<I", len(sig)) + sig + enc + suffix
+        data = b""
+        for chunk in chunks(req, 16384):
+            data += b"--Encrypted Boundary\r\n"
+            data += f"Content-Type: {protocol}\r\n".encode()
+            data += f"OriginalContent: type=application/soap+xml;charset=UTF-8;Length={len(chunk)}\r\n".encode()
+            data += b"--Encrypted Boundary\r\n"
 
-        return data, f'multipart/encrypted;protocol="{protocol}";boundary="Encrypted Boundary"'
+            sig, enc = wrap_fn(chunk)
+            data += b"Content-Type: application/octet-stream\r\n" + pack("<I", len(sig)) + sig + enc
 
-    def _decrypted_response(self, rsp, unwrap):
+        data += b"--Encrypted Boundary--\r\n"
+
+        return self.session.prepare_request(Request("POST", url=self.url, data=data, headers={
+            "Content-Type" : f'multipart/x-multi-encrypted;protocol="{protocol}";boundary="Encrypted Boundary"'
+        }))
+
+    def _decrypted_response(self, rsp, unwrap_fn):
         if rsp.status_code not in (200, 500):
             return rsp
 
         prefix = b"\r\nContent-Type: application/octet-stream\r\n"
         plaintext = b""
-        for body in rsp.content.split(b"--Encrypted Boundary"):
-            if not body.startswith(prefix):
+        for part in rsp.content.split(b"--Encrypted Boundary"):
+            if not part.startswith(prefix):
                 continue
-            body = body.removeprefix(prefix)
-            sig_len = unpack("<I", body[:4])[0]
-            plaintext += unwrap(body[4:4+sig_len], body[4+sig_len:])
+            part = part.removeprefix(prefix)
+            sig_len = unpack("<I", part[:4])[0]
+            plaintext += unwrap_fn(part[4:4+sig_len], part[4+sig_len:])
 
         rsp.headers["Content-Type"] = "application/soap+xml;charset=UTF-8"
         rsp.headers["Content-Length"] = str(len(plaintext))
@@ -716,9 +690,7 @@ class SPNEGOTransport(Transport):
         self._auth()
 
     def _send(self, req):
-        sig, enc = self.proxy.wrap(req)
-        data, content_type = self._encrypted_request(sig, enc, len(req), "SPNEGO")
-        rsp = self.session.post(self.url, data=data, headers={ "Content-Type" : content_type })
+        rsp = self.session.send(self._encrypted_request(req, "SPNEGO", self.proxy.wrap))
         return self._decrypted_response(rsp, self.proxy.unwrap)
 
     def _auth(self):
@@ -748,9 +720,7 @@ class KerberosTransport(Transport):
         self._auth()
 
     def _send(self, req):
-        sig, enc = self.proxy.wrap(req)
-        data, content_type = self._encrypted_request(sig, enc, len(req), "Kerberos")
-        rsp = self.session.post(self.url, data=data, headers={ "Content-Type" : content_type })
+        rsp = self.session.send(self._encrypted_request(req, "Kerberos", self.proxy.wrap))
         return self._decrypted_response(rsp, self.proxy.unwrap)
 
     def _auth(self):
@@ -777,9 +747,7 @@ class CredSSPTransport(Transport):
         self._auth()
 
     def _send(self, req):
-        sig, enc = self._wrap(req)
-        data, content_type = self._encrypted_request(sig, enc, len(req), "CredSSP")
-        rsp = self.session.post(self.url, data=data, headers={ "Content-Type" : content_type })
+        rsp = self.session.send(self._encrypted_request(req, "CredSSP", self._wrap))
         return self._decrypted_response(rsp, self._unwrap)
 
     def _auth(self):
@@ -873,31 +841,36 @@ class CredSSPTransport(Transport):
 # -- MS-PSRP stuff from https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-psrp ------
 class Runspace:
     def __init__(self, transport, timeout=1):
-        self.transport          = transport
-        self.timeout            = timeout
-        self.object_buffer      = {}
-        self.next_object_id     = 1
-        self.session_id         = str(uuid.uuid4()).upper()
-        self.shell_id           = str(uuid.uuid4()).upper()
-        self.command_id         = None
+        self.transport       = transport
+        self.timeout         = timeout
+        self.fragment_buffer = {}
+        self.next_object_id  = 1
+        self.session_id      = str(uuid.uuid4()).upper()
+        self.runspace_id     = str(uuid.uuid4()).upper()
+        self.pipeline_id     = str(uuid.uuid4()).upper()
+        self.shell_id        = None
+        self.command_id      = None
 
     def __enter__(self):
-        messages = fragment(self.next_object_id, [
-            (SESSION_CAPABILITY, self.shell_id, zero_uuid, ps_capability),
-            (INIT_RUNSPACEPOOL,  self.shell_id, zero_uuid, ps_runspace_pool)
-        ])
-
-        req = soap_req("create", self.session_id, timeout=self.timeout)
+        req = soap_req("create", self.session_id, timeout=10)
         options = req.find("s:Header").find("wsman:OptionSet")
         protocolversion = { "Name" : "protocolversion", "MustComply" : "true" }
         ET.SubElement(options, "wsman:Option", protocolversion).text = "2.1"
 
-        shell = ET.SubElement(req.find("s:Body"), "rsp:Shell", { "ShellId" : self.shell_id })
-        ET.SubElement(shell, "rsp:InputStreams").text = "stdin pr"
+        shell = ET.SubElement(req.find("s:Body"), "rsp:Shell")
+        ET.SubElement(shell, "rsp:ShellId").text = "http://localhost/wsman"
+        ET.SubElement(shell, "rsp:InputStreams").text = "stdin"
         ET.SubElement(shell, "rsp:OutputStreams").text = "stdout"
-        ET.SubElement(shell, "creationXml").text = b64str(messages)
+        ET.SubElement(shell, "creationXml").text = b64str(self._fragment([
+            (SESSION_CAPABILITY, ps_capability),
+            (INIT_RUNSPACEPOOL,  ps_runspace_pool)
+        ]))
 
-        self._post(req)
+        rsp = self._post(req)
+        if "fault" in rsp:
+            raise RuntimeError(rsp["reason"])
+
+        self.shell_id = rsp.get("shell_id")
         self._receive()
         self._receive()
         return self
@@ -925,9 +898,10 @@ class Runspace:
                     return
 
             timeouts = 0
-            for msg_type, msg, _, _ in defragment(rsp.get("streams"), self.object_buffer):
+            for msg_type, msg in self._defragment(rsp["streams"]):
                 if msg_type == PIPELINE_OUTPUT: # from Write-Output
-                    yield { "stdout" : xml_get_text(msg, ".", "") }
+                    if msg.tag == "S":
+                        yield { "stdout" : utfstr(msg.text) or "" }
 
                 elif msg_type == ERROR_RECORD: # from Write-Error
                     yield { "error" : xml_get_text(msg, ".//ToString", "unknown error") }
@@ -936,7 +910,7 @@ class Runspace:
                     yield { "warn" : xml_get_text(msg, ".//ToString", "unknown warning") }
 
                 elif msg_type == VERBOSE_RECORD: # from Write-Verbose
-                    yield { "verbose" : xml_get_text(msg, "ToString", "") }
+                    yield { "verbose" : xml_get_text(msg, ".//ToString", "") }
 
                 elif msg_type == INFORMATION_RECORD: # from Write-Host
                     info = xml_get_text(msg, ".//Props/S[@N='Message']", "")
@@ -953,9 +927,8 @@ class Runspace:
                     activity = xml_get_text(msg, ".//S[@N='Activity']", "activity")
                     yield { "progress" : status or activity }
 
-            if rsp["state"]:
-                if rsp["state"].endswith("CommandState/Done"):
-                    break
+            if rsp["state"].endswith("CommandState/Done"):
+              break
 
         self.command_id = None
 
@@ -969,7 +942,8 @@ class Runspace:
 
     def _post(self, req):
         rsp = ET.fromstring(self.transport.send(ET.tostring(req, encoding="utf8")))
-        action = rsp.find("./s:Header/a:Action", soap_ns).text
+        #  print(ET.tostring(rsp))
+        action = rsp.find("./s:Header/wsa:Action", soap_ns).text
         if action.endswith("wsman/fault"):
             return {
                 "fault"   : "ok",
@@ -984,44 +958,92 @@ class Runspace:
                 "state"   : xml_get_attrib(rsp, ".//rsp:CommandState", "State", "")
             }
         elif action.endswith("transfer/CreateResponse"):
-            return { "create" : "ok" }
+            return {
+                "create" : "ok",
+                "shell_id" : xml_get_text(rsp, ".//rsp:Shell/rsp:ShellId", "")
+            }
         elif action.endswith("shell/CommandResponse"):
-            return { "command" : "ok" }
+            return {
+                "command" : "ok",
+                "command_id" : xml_get_text(rsp, ".//rsp:CommandId", "")
+            }
         elif action.endswith("shell/SignalResponse"):
             return { "signal" : "ok" }
         elif action.endswith("transfer/DeleteResponse"):
             return { "delete" : "ok" }
         else:
+            logging.debug(ET.tostring(rsp))
             raise NotImplementedError(action)
 
     def _receive(self, command_id=None):
         req = soap_req("receive", self.session_id, self.shell_id, self.timeout)
+
+        options = req.find("s:Header").find("wsman:OptionSet")
+        ET.SubElement(options, "wsman:Option", { "Name" : "WSMAN_CMDSHELL_OPTION_KEEPALIVE" }).text = "true"
+
         receive = ET.SubElement(req.find("s:Body"), "rsp:Receive")
-        if command_id:
-            ET.SubElement(receive, "rsp:DesiredStream", { "CommandId" : command_id }).text = "stdout"
-        else:
-            ET.SubElement(receive, "rsp:DesiredStream").text = "stdout"
+        attr = { "CommandId" : command_id } if command_id else {}
+        ET.SubElement(receive, "rsp:DesiredStream", attr).text = "stdout"
 
-        return self._post(req)
+        rsp = self._post(req)
 
-    def _create_pipeline(self, cmd, host_ui=False):
-        command_id = str(uuid.uuid4()).upper()
+        return rsp
 
-        create_pipeline = ps_create_pipeline([
+    def _create_pipeline(self, cmd, is_script=False):
+        pipeline = ps_create_pipeline([
             ps_command("Invoke-Expression", { "Command" : cmd }),
             ps_command("Out-String", { "Stream" : None })
         ])
-        messages = fragment(self.next_object_id, [
-            (CREATE_PIPELINE, self.shell_id, command_id, create_pipeline)
-        ])
-
         req = soap_req("command", self.session_id, self.shell_id, self.timeout)
-        cmdline = ET.SubElement(req.find("s:Body"), "rsp:CommandLine", { "CommandId" : command_id })
+        cmdline = ET.SubElement(req.find("s:Body"), "rsp:CommandLine")
         ET.SubElement(cmdline, "rsp:Command")
-        ET.SubElement(cmdline, "rsp:Arguments").text = b64str(messages)
-        rsp = self._post(req)
-        if "command" in rsp:
-            return command_id
+        ET.SubElement(cmdline, "rsp:Arguments").text = b64str(self._fragment([
+            (CREATE_PIPELINE, pipeline)
+        ]))
+        return self._post(req).get("command_id")
+
+    def _fragment(self, messages):
+        fragments = b""
+
+        for msg_type, data in messages:
+            msg_data  = pack("<II", 0x00002, msg_type)
+            msg_data += uuid.UUID(self.runspace_id).bytes_le
+            msg_data += uuid.UUID(self.pipeline_id).bytes_le
+            msg_data += ET.tostring(data)
+            fragments += pack(">QQBI", self.next_object_id, 0, 3, len(msg_data)) + msg_data
+            self.next_object_id += 1
+
+        return fragments
+
+    def _defragment(self, streams):
+        for buf in streams:
+            fragments = []
+            while buf:
+                object_id, _, start_end, msg_len = unpack(">QQBI", buf[:21])
+                partial = buf[21:21 + msg_len]
+                buf = buf[21 + msg_len:]
+
+                if start_end == 3: # start and end
+                    fragments.append(partial)
+                    continue
+
+                if object_id not in self.fragment_buffer:
+                    self.fragment_buffer[object_id] = b""
+
+                if start_end == 2: # end
+                    fragments.append(self.fragment_buffer[object_id] + partial)
+                    del self.fragment_buffer[object_id]
+                else: # start or middle
+                    self.fragment_buffer[object_id] += partial
+
+            for frag in fragments:
+                _, msg_type = unpack("<II", frag[:8])
+                if frag[40:]:
+                    msg = ET.fromstring(frag[40:])
+                    yield (msg_type, msg)
+                else:
+                    print(">>>>>>", msg_ids[msg_type])
+
 
 # -------------------------------------------------------------------------------------------------
 # so with Runspace class you can execute commands like this:
@@ -1031,7 +1053,7 @@ class Runspace:
 # >>>     for output in runspace.run_command("whoami /all"):
 # >>>         print(output)
 
-# the rest of the code here parses impacket-style arguments (in main) and implements a
+# the rest of the code here parses impacket-style arguments and implements a
 # simple shell that runs a REPL loop:
 
 from signal import SIGINT, signal, getsignal
@@ -1044,7 +1066,7 @@ try:
     prompt_toolkit_available = sys.stdout.isatty()
 except ModuleNotFoundError:
     print("'prompt_toolkit' not installed, using built-in 'readline'")
-    import readline, atexit
+    import readline
     prompt_toolkit_available = False
 
 
@@ -1117,6 +1139,8 @@ class Shell:
                 else:
                     cmd = input(pre)
             except KeyboardInterrupt:
+                if not prompt_toolkit_available:
+                    print()
                 continue
             except EOFError:
                 return
@@ -1131,7 +1155,7 @@ class Shell:
             print(clear + out["stdout"], flush=True)
 
         elif "info" in out: # from Write-Host
-            print(clear + out["info"], end=out.get("endl"), flush=True)
+            print(clear + out["info"], end=out["endl"], flush=True)
 
         elif "error" in out: # from Write-Error and exceptions
             print(clear + "\x1b[31m" + out["error"] + "\x1b[0m", flush=True)
@@ -1155,7 +1179,7 @@ class Shell:
     def run_with_interrupt(self, cmd, output_handler=None, exception_handler=None):
         output_stream = self.runspace.run_command(cmd)
         while True:
-            with CtrlCHandler(timeout=5) as h:
+            with CtrlCHandler(timeout=self.runspace.timeout) as h:
                 try:
                     out = next(output_stream)
                 except StopIteration:
@@ -1195,7 +1219,7 @@ def get_krb_creds(dc_ip, spn, domain, username, password="", nt_hash="", aes_key
         tgt, cipher, _, tgtkey = getKerberosTGT(user, password, domain, "", nt_hash, aes_key, dc_ip)
 
     if not tgt:
-        raise RuntimeError("Kerberos: could not get TGT or TGS")
+        raise TransportError("Kerberos: could not get TGT or TGS")
 
     logging.info(f"requesting TGS for {spn}")
     tgs, cipher, _, tgskey = getKerberosTGS(http, domain, dc_ip, tgt, cipher, tgtkey)
@@ -1217,11 +1241,11 @@ def create_transport(args):
 
     if sum((args.k, args.basic, bool(args.cert_pem or args.cert_key))) > 1:
         logging.fatal("'-k', '-basic', and '-cert-*' are mutually excluseive, pick one or none")
-        exit()
+        return
 
     if args.credssp and (args.basic or args.cert_pem or args.cert_key):
         logging.fatal("'-credssp' does not work with '-basic' or '-cert-*'")
-        exit()
+        return
 
     aes_key = args.aesKey
     nt_hash = args.hashes.split(':')[1] if ':' in args.hashes else ""
@@ -1238,7 +1262,7 @@ def create_transport(args):
     else:
         target_ip = args.target_ip
 
-    if not args.port:
+    if not args.port and not args.url:
         port = 5986 if args.ssl else 5985
         logging.info(f"'-port' not specified, using {port}")
     else:
@@ -1256,25 +1280,26 @@ def create_transport(args):
     if args.basic:
         if not username or not password:
             logging.fatal(f"Need username and password for basic auth")
-            exit()
+            return
         return BasicTransport(url, username, password)
 
     elif args.cert_pem or args.cert_key:
         if not args.cert_pem:
             logging.fatal("Missing client certificate (-cert-pem)")
-            exit()
+            return
         if not Path(args.cert_pem).is_file():
             logging.fatal(f"Could not find client certificate file {args.cert_pem}")
-            exit()
+            return
         if not args.cert_key:
             logging.fatal("Missing client certificate private key (-cert-key)")
-            exit()
+            return
         if not Path(args.cert_key).is_file():
             logging.fatal(f"Could not find client certificate key file {args.cert_key}")
-            exit()
+            return
         if not urlparse(url).scheme == "https":
             logging.fatal("Authentication with client certificate works only over https")
-            exit()
+            return
+
         return ClientCertTransport(url, args.cert_pem, args.cert_key)
 
     nt_creds = None
@@ -1289,13 +1314,13 @@ def create_transport(args):
 
         elif not domain or not username or not has_creds:
             logging.fatal("Need domain, username and one of password/nthash/aes for kerberos auth")
-            exit()
+            return
 
         if not args.spn:
             try:
                 ip_address(targetName)
                 logging.error(f"when '-spn' is not specified 'targetName' can not be IP")
-                exit()
+                return
             except ValueError:
                 spn = f"HTTP/{targetName}@{domain}"
                 logging.info(f"'-spn' not specified, using {spn}")
@@ -1314,7 +1339,7 @@ def create_transport(args):
         creds = nt_creds or krb_creds
         if not creds.username or not creds.password:
             logging.error("CredSSP needs username and password, even for kerberos")
-            exit()
+            return
         return CredSSPTransport(url, creds)
 
     elif args.k:
@@ -1385,10 +1410,9 @@ def argument_parser():
     parser.add_argument("-X", default="", metavar="COMMAND",
         help="Command to execute, if ommited it will spawn a janky interactive shell")
 
-    parser.add_argument("-timeout", default="1", metavar="SEC", help="Timeout for requests to /wsman")
+    parser.add_argument("-timeout", default="1", metavar="SECONDS", help="Timeout for requests to /wsman")
 
     return parser
-
 
 def main():
     print(version.BANNER)
@@ -1402,6 +1426,8 @@ def main():
         logging.getLogger().setLevel(logging.INFO)
 
     transport = create_transport(args)
+    if transport is None:
+        exit()
 
     with Runspace(transport, int(args.timeout)) as runspace:
         shell = Shell(runspace)
@@ -1415,4 +1441,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
