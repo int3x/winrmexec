@@ -75,23 +75,6 @@ def utfstr(s):
     except:
         return s
 
-def split_args(cmdline):
-    try:
-        args = shlex.split(cmdline, posix=False)
-    except ValueError:
-        return []
-
-    fixed = []
-    for arg in args:
-        if arg.startswith('"') and arg.endswith('"'):
-            fixed.append(arg[1:-1])
-        elif arg.startswith("'") and arg.endswith("'"):
-            fixed.append(arg[1:-1])
-        else:
-            fixed.append(arg)
-    return fixed
-
-
 zero_uuid = str(uuid.UUID(bytes_le=bytes(16))).upper()
 
 # stolen from https://github.com/skelsec/asyauth/blob/main/asyauth/protocols/kerberos/gssapi.py
