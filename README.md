@@ -1,6 +1,8 @@
 # winrmexec
 Impacket-based WinRM client with support for NTLM and Kerberos authentication over HTTP and HTTPS in the spirit of `smbexec.py` and `psexec.py`. You can run a single command with `-X 'whoami /all'`, or use the "shell" mode to issue multiple commands. It depends on `impacket`, `requests`, and optionally `prompt_toolkit` python packages. If `prompt_toolkit` is not installed on your system, it defaults to the built-in `readline` module.
 
+(Experimental) `evil_winrmexec.py` adds a custom shell to replicate some of the features of `evil-winrm` like AMSI bypasses ability to download and upload files, run scripts/.NET executables from remote http, etc.
+
 ## Examples:
 In the following examples impacket's "target" format will be used: `[[domain/]username[:password]@]<target>`.
 
