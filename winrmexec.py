@@ -613,14 +613,31 @@ class Transport:
         if rsp.status_code not in (200, 500):
             return rsp
 
-        prefix = b"\r\nContent-Type: application/octet-stream\r\n"
+        # The prefix can have tabs or spaces - let's handle both
+        prefix_space = b"\r\nContent-Type: application/octet-stream\r\n"
+        prefix_tab = b"\r\n\tContent-Type: application/octet-stream\r\n"
         plaintext = b""
-        for part in rsp.content.split(b"--Encrypted Boundary"):
-            if not part.startswith(prefix):
+        
+        parts = rsp.content.split(b"--Encrypted Boundary")
+        
+        for i, part in enumerate(parts):
+            if part.startswith(prefix_space):
+                part = part.removeprefix(prefix_space)
+            elif part.startswith(prefix_tab):
+                part = part.removeprefix(prefix_tab)
+            else:
                 continue
-            part = part.removeprefix(prefix)
+                
+            if len(part) < 4:
+                continue
             sig_len = unpack("<I", part[:4])[0]
-            plaintext += unwrap_fn(part[4:4+sig_len], part[4+sig_len:])
+            if len(part) < 4 + sig_len:
+                continue
+            try:
+                decrypted = unwrap_fn(part[4:4+sig_len], part[4+sig_len:])
+                plaintext += decrypted
+            except Exception as e:
+                logging.debug(f"Part {i} decryption failed: {e}")
 
         rsp.headers["Content-Type"] = "application/soap+xml;charset=UTF-8"
         rsp.headers["Content-Length"] = str(len(plaintext))
